@@ -1,11 +1,19 @@
 # ============================================================
+# HUGGING FACE CPU OPTIMIZED PADDLEOCR FASTAPI
+# ============================================================
+
 # IMPORTANT:
-# Disable Paddle oneDNN/MKLDNN BEFORE importing paddleocr
+# These MUST be set BEFORE importing paddle / paddleocr.
 # ============================================================
 
 import os
 
 os.environ["PADDLE_PDX_ENABLE_MKLDNN_BYDEFAULT"] = "0"
+os.environ["FLAGS_use_mkldnn"] = "0"
+os.environ["FLAGS_allocator_strategy"] = "auto_growth"
+
+# Hugging Face Spaces uses port 7860
+PORT = int(os.environ.get("PORT", "7860"))
 
 # ============================================================
 # IMPORTS
@@ -15,6 +23,7 @@ import re
 import uuid
 import shutil
 import json
+import tempfile
 
 from typing import Dict, Any, List, Optional
 
@@ -30,6 +39,7 @@ from fastapi.responses import JSONResponse
 
 from paddleocr import PaddleOCR
 
+
 # ============================================================
 # APPLICATION
 # ============================================================
@@ -37,38 +47,64 @@ from paddleocr import PaddleOCR
 app = FastAPI(
     title="Dynamic Image Key Value OCR API",
     description="Extract only requested key-value pairs from image",
-    version="4.0.0"
+    version="5.0.0"
 )
+
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-UPLOAD_DIR = "uploads"
+# Use /tmp on Hugging Face.
+# Do not depend on persistent local storage.
+
+UPLOAD_DIR = os.environ.get(
+    "UPLOAD_DIR",
+    "/tmp/ocr_uploads"
+)
 
 os.makedirs(
     UPLOAD_DIR,
     exist_ok=True
 )
 
+
+# Maximum upload size:
+# 10 MB
+MAX_FILE_SIZE = 10 * 1024 * 1024
+
+
 # ============================================================
 # OCR INITIALIZATION
+#
+# IMPORTANT:
+# This happens ONCE when the application starts.
+#
+# Do NOT create PaddleOCR inside /extract.
 # ============================================================
 
 print("==============================================")
-print("Loading PaddleOCR model...")
+print("Loading PaddleOCR...")
+print("CPU MODE")
+print("MKLDNN DISABLED")
 print("==============================================")
+
 
 try:
 
     ocr = PaddleOCR(
         lang="en",
+
+        # CPU friendly settings
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
         use_textline_orientation=False
     )
 
+    print("==============================================")
     print("PaddleOCR loaded successfully.")
+    print("==============================================")
+
 
 except Exception as e:
 
@@ -89,17 +125,22 @@ except Exception as e:
 
 @app.get("/")
 def root():
+
     return {
         "success": True,
         "message": "Dynamic Image OCR API is running",
-        "endpoint": "POST /extract"
+        "endpoint": "POST /extract",
+        "platform": "Hugging Face Spaces",
+        "ocr": "PaddleOCR CPU"
     }
 
 
 @app.get("/health")
 def health():
+
     return {
-        "status": "UP"
+        "status": "UP",
+        "ocr_loaded": ocr is not None
     }
 
 
@@ -110,6 +151,7 @@ def health():
 def clean_key(
         key: str
 ) -> str:
+
     if not key:
         return ""
 
@@ -137,6 +179,7 @@ def clean_key(
 def clean_value(
         value: str
 ) -> str:
+
     if not value:
         return ""
 
@@ -158,29 +201,17 @@ def clean_value(
 def clean_numeric_value(
         value: str
 ) -> str:
+
     if not value:
         return ""
 
     value = value.strip()
 
-    # Remove common OCR separators
     value = re.sub(
         r"^[\s:=]+",
         "",
         value
     )
-
-    # ========================================================
-    # NUMBER
-    #
-    # Examples:
-    #
-    # 8.8
-    # 38.0
-    # -5.2
-    # +10
-    # 100
-    # ========================================================
 
     match = re.search(
         r"[-+]?\d+(?:\.\d+)?",
@@ -200,6 +231,7 @@ def clean_numeric_value(
 def is_numeric_value(
         text: str
 ) -> bool:
+
     if not text:
         return False
 
@@ -213,30 +245,25 @@ def is_numeric_value(
 
 # ============================================================
 # NORMALIZE TEXT
-#
-# IMPORTANT:
-# NO STATIC KEYS ARE USED HERE.
 # ============================================================
 
 def normalize_key(
         text: str
 ) -> str:
+
     if not text:
         return ""
 
     text = text.strip()
 
-    # Remove OCR spaces
     text = re.sub(
         r"\s+",
         "",
         text
     )
 
-    # Uppercase only for comparison
     text = text.upper()
 
-    # Remove surrounding punctuation
     text = re.sub(
         r"^[\-\:\=\.\,\s]+",
         "",
@@ -254,14 +281,12 @@ def normalize_key(
 
 # ============================================================
 # NORMALIZE REQUESTED KEYS
-#
-# No predefined/static key list.
-# Whatever user sends becomes the requested key.
 # ============================================================
 
 def normalize_requested_keys(
         keys: List[str]
 ) -> List[str]:
+
     normalized = []
 
     for key in keys:
@@ -282,22 +307,13 @@ def normalize_requested_keys(
 
 # ============================================================
 # COMPARE KEYS
-#
-# Generic comparison.
-#
-# Example:
-#
-# "WBC"     == "wbc"
-# "LYMPH#"  == "lymph#"
-# "Next ID" == "nextid"
-#
-# No static key names.
 # ============================================================
 
 def keys_match(
         ocr_key: str,
         requested_key: str
 ) -> bool:
+
     if not ocr_key or not requested_key:
         return False
 
@@ -320,6 +336,7 @@ def find_requested_key(
         line: str,
         requested_keys: List[str]
 ) -> Optional[str]:
+
     if not line:
         return None
 
@@ -339,12 +356,6 @@ def find_requested_key(
 
     # ========================================================
     # KEY WITH ":" OR "="
-    #
-    # Example:
-    #
-    # ID:15
-    # WBC:8.8
-    # Name:Amol
     # ========================================================
 
     separator_match = re.match(
@@ -366,12 +377,6 @@ def find_requested_key(
 
     # ========================================================
     # KEY FOLLOWED BY VALUE
-    #
-    # Example:
-    #
-    # WBC 8.8
-    # Name Amol
-    # Age 25
     # ========================================================
 
     for requested_key in requested_keys:
@@ -392,14 +397,10 @@ def find_requested_key(
                 len(key_normalized):
             ]
 
-            # Make sure the remaining part
-            # is actually a value/separator.
             if (
                     not remaining
-                    or
-                    remaining[0].isdigit()
-                    or
-                    remaining[0] in ":=-"
+                    or remaining[0].isdigit()
+                    or remaining[0] in ":=-"
             ):
                 return requested_key
 
@@ -414,21 +415,14 @@ def extract_value_from_same_line(
         line: str,
         requested_key: str
 ) -> str:
+
     if not line:
         return ""
 
     line = line.strip()
 
     # ========================================================
-    # CASE 1
-    #
     # Key:Value
-    #
-    # Example:
-    #
-    # ID:15
-    # Name:Amol
-    # WBC:8.8
     # ========================================================
 
     match = re.match(
@@ -439,19 +433,19 @@ def extract_value_from_same_line(
     if match:
 
         key_part = match.group(1).strip()
+
         value_part = match.group(2).strip()
 
         if keys_match(
                 key_part,
                 requested_key
         ):
+
             return clean_value(
                 value_part
             )
 
     # ========================================================
-    # CASE 2
-    #
     # Key=Value
     # ========================================================
 
@@ -463,26 +457,20 @@ def extract_value_from_same_line(
     if match:
 
         key_part = match.group(1).strip()
+
         value_part = match.group(2).strip()
 
         if keys_match(
                 key_part,
                 requested_key
         ):
+
             return clean_value(
                 value_part
             )
 
     # ========================================================
-    # CASE 3
-    #
     # Key Value
-    #
-    # Example:
-    #
-    # WBC 8.8
-    # Age 25
-    # Name Amol
     # ========================================================
 
     key_normalized = normalize_key(
@@ -497,7 +485,6 @@ def extract_value_from_same_line(
             key_normalized
     ):
 
-        # Get original text after key
         key_length = len(
             requested_key
         )
@@ -513,6 +500,7 @@ def extract_value_from_same_line(
         )
 
         if remaining:
+
             return clean_value(
                 remaining
             )
@@ -522,9 +510,6 @@ def extract_value_from_same_line(
 
 # ============================================================
 # EXTRACT VALUE FROM FOLLOWING LINES
-#
-# Completely dynamic.
-# No static medical keys.
 # ============================================================
 
 def extract_value_from_next_lines(
@@ -533,9 +518,6 @@ def extract_value_from_next_lines(
         requested_key: str,
         requested_keys: List[str]
 ) -> str:
-    # ========================================================
-    # Search next few OCR lines
-    # ========================================================
 
     for j in range(
             current_index + 1,
@@ -551,8 +533,7 @@ def extract_value_from_next_lines(
             continue
 
         # ====================================================
-        # If next line is another requested key,
-        # stop searching.
+        # Stop if another requested key appears.
         # ====================================================
 
         another_key = find_requested_key(
@@ -573,25 +554,11 @@ def extract_value_from_next_lines(
         )
 
         if same_line_value:
+
             return same_line_value
 
         # ====================================================
         # NUMERIC VALUE
-        #
-        # If OCR gives:
-        #
-        # WBC
-        # 8.8
-        #
-        # return 8.8
-        #
-        # Also:
-        #
-        # WBC
-        # W
-        # 8.8
-        #
-        # skip W and return 8.8
         # ====================================================
 
         if is_numeric_value(
@@ -603,29 +570,17 @@ def extract_value_from_next_lines(
             )
 
             if numeric_value:
+
                 return numeric_value
 
         # ====================================================
-        # NON-NUMERIC VALUE
-        #
-        # Example:
-        #
-        # Name
-        # Amol
-        #
-        # Date
-        # 27-08-2026
-        #
-        # Since date contains numbers it will also work.
+        # TEXT VALUE
         # ====================================================
 
-        # If line contains no number,
-        # it may still be a valid text value.
-        #
-        # We accept it only when it does not look like
-        # random single-character OCR noise.
+        if len(
+                next_line.strip()
+        ) > 1:
 
-        if len(next_line.strip()) > 1:
             return clean_value(
                 next_line
             )
@@ -635,21 +590,14 @@ def extract_value_from_next_lines(
 
 # ============================================================
 # MAIN DYNAMIC EXTRACTION
-#
-# THIS IS THE IMPORTANT PART.
-#
-# There are NO STATIC MEDICAL KEYS.
 # ============================================================
 
 def extract_requested_key_values(
         lines: List[str],
         requested_keys: List[str]
 ) -> Dict[str, Any]:
-    result = {}
 
-    # ========================================================
-    # LOOP OCR LINES
-    # ========================================================
+    result = {}
 
     for i, line in enumerate(lines):
 
@@ -657,11 +605,6 @@ def extract_requested_key_values(
 
         if not line:
             continue
-
-        # ====================================================
-        # CHECK WHETHER THIS LINE CONTAINS
-        # ONE OF THE USER REQUESTED KEYS
-        # ====================================================
 
         requested_key = find_requested_key(
             line,
@@ -672,7 +615,7 @@ def extract_requested_key_values(
             continue
 
         # ====================================================
-        # SAME LINE VALUE
+        # SAME LINE
         # ====================================================
 
         value = extract_value_from_same_line(
@@ -683,12 +626,13 @@ def extract_requested_key_values(
         if value:
 
             if requested_key not in result:
+
                 result[requested_key] = value
 
             continue
 
         # ====================================================
-        # VALUE IN NEXT LINES
+        # NEXT LINES
         # ====================================================
 
         value = extract_value_from_next_lines(
@@ -701,6 +645,7 @@ def extract_requested_key_values(
         if value:
 
             if requested_key not in result:
+
                 result[requested_key] = value
 
     # ========================================================
@@ -712,6 +657,7 @@ def extract_requested_key_values(
     for requested_key in requested_keys:
 
         if requested_key in result:
+
             ordered_result[requested_key] = result[
                 requested_key
             ]
@@ -726,6 +672,7 @@ def extract_requested_key_values(
 def extract_text_from_image(
         image_path: str
 ) -> List[str]:
+
     all_text = []
 
     print("Running OCR...")
@@ -765,6 +712,7 @@ def extract_text_from_image(
                 # ------------------------------------------------
 
                 if callable(data):
+
                     data = data()
 
                 # ------------------------------------------------
@@ -815,6 +763,7 @@ def extract_text_from_image(
                         ).strip()
 
                         if text:
+
                             all_text.append(
                                 text
                             )
@@ -844,6 +793,7 @@ def extract_text_from_image(
                             ).strip()
 
                             if text:
+
                                 all_text.append(
                                     text
                                 )
@@ -894,6 +844,7 @@ def extract_text_from_image(
     print("==============================================")
 
     for line in cleaned_text:
+
         print(
             " ->",
             line
@@ -911,7 +862,9 @@ def extract_text_from_image(
 def parse_keys(
         keys_string: str
 ) -> List[str]:
+
     if not keys_string:
+
         raise HTTPException(
             status_code=400,
             detail="keys is required"
@@ -921,12 +874,6 @@ def parse_keys(
 
     # ========================================================
     # JSON ARRAY
-    #
-    # [
-    #   "ID",
-    #   "Time",
-    #   "WBC"
-    # ]
     # ========================================================
 
     try:
@@ -952,11 +899,13 @@ def parse_keys(
                     item = item.strip()
 
                     if item:
+
                         keys.append(
                             item
                         )
 
             if not keys:
+
                 raise HTTPException(
                     status_code=400,
                     detail="keys array is empty"
@@ -972,8 +921,6 @@ def parse_keys(
 
     # ========================================================
     # COMMA SEPARATED
-    #
-    # ID,Time,WBC,HGB
     # ========================================================
 
     keys = [
@@ -983,6 +930,7 @@ def parse_keys(
     ]
 
     if not keys:
+
         raise HTTPException(
             status_code=400,
             detail="No valid keys found"
@@ -1005,11 +953,13 @@ async def extract(
         keys: str = Form(...)
 
 ):
+
     # ========================================================
     # VALIDATE IMAGE
     # ========================================================
 
     if not image.filename:
+
         raise HTTPException(
             status_code=400,
             detail="Image file is required"
@@ -1046,6 +996,7 @@ async def extract(
         ".png",
         ".bmp",
         ".webp"
+
     }
 
     extension = os.path.splitext(
@@ -1053,6 +1004,7 @@ async def extract(
     )[1].lower()
 
     if extension not in allowed_extensions:
+
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1062,12 +1014,12 @@ async def extract(
         )
 
     # ========================================================
-    # UNIQUE FILE NAME
+    # CREATE TEMPORARY FILE
     # ========================================================
 
     filename = (
-            str(uuid.uuid4())
-            + extension
+        str(uuid.uuid4())
+        + extension
     )
 
     image_path = os.path.join(
@@ -1084,21 +1036,48 @@ async def extract(
     try:
 
         # ====================================================
-        # SAVE IMAGE
+        # SAVE IMAGE WITH SIZE LIMIT
         # ====================================================
+
+        total_size = 0
 
         with open(
                 image_path,
                 "wb"
         ) as buffer:
 
-            shutil.copyfileobj(
-                image.file,
-                buffer
-            )
+            while True:
+
+                chunk = await image.read(
+                    1024 * 1024
+                )
+
+                if not chunk:
+                    break
+
+                total_size += len(
+                    chunk
+                )
+
+                if total_size > MAX_FILE_SIZE:
+
+                    raise HTTPException(
+                        status_code=413,
+                        detail="Image size cannot exceed 10 MB"
+                    )
+
+                buffer.write(
+                    chunk
+                )
 
         print(
             "Image saved successfully."
+        )
+
+        print(
+            "Image size:",
+            total_size,
+            "bytes"
         )
 
         # ====================================================
@@ -1133,6 +1112,7 @@ async def extract(
             "data": key_values,
 
             "raw_text": lines
+
         }
 
         # ====================================================
@@ -1206,17 +1186,34 @@ async def extract(
                     str(e)
                 )
 
+        try:
+
+            await image.close()
+
+        except Exception:
+
+            pass
+
 
 # ============================================================
 # RUN APPLICATION
+#
+# Hugging Face:
+# PORT = 7860
+#
+# IMPORTANT:
+# Use ONE worker because PaddleOCR is memory heavy.
 # ============================================================
 
 if __name__ == "__main__":
+
     import uvicorn
 
     uvicorn.run(
-        "main:app",
+        app,
         host="0.0.0.0",
-        port=8000,
+        port=PORT,
+        workers=1,
         reload=False
     )
+
