@@ -1,57 +1,153 @@
 package com.OCR.Reader.service.impl;
 
-import com.OCR.Reader.util.OCRProcessor;
-import com.OCR.Reader.constants.AppConstants;
-import com.OCR.Reader.pojo.OCRResult;
-import com.OCR.Reader.service.OCRService;
-import lombok.extern.slf4j.Slf4j;
+import java.io.File;
+import java.io.IOException;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
 import org.springframework.stereotype.Service;
 import org.springframework.web.multipart.MultipartFile;
 
-import java.io.File;
-import java.io.IOException;
+import com.OCR.Reader.constants.AppConstants;
+import com.OCR.Reader.pojo.OCRResult;
+import com.OCR.Reader.service.OCRService;
+import com.OCR.Reader.util.OCRProcessor;
+
+import lombok.extern.slf4j.Slf4j;
 
 @Service
 @Slf4j
 public class OCRServiceImpl implements OCRService {
-    @Override
-    public OCRResult processImage(MultipartFile file) {
+	@Override
+	public OCRResult processImage(MultipartFile file, List<String> keys) {
 
-        OCRResult result = new OCRResult();
-        try {
-            //Save file to a temp location
+		OCRResult result = new OCRResult();
 
-            File tempFile = File.createTempFile("ocr",".tmp");
-            file.transferTo(tempFile);
+		File tempFile = null;
 
-            //Perform OCR
-            OCRProcessor ocrProcessor = new OCRProcessor();
-            String extractedText = ocrProcessor.extractTextFromImage(tempFile);
+		try {
 
-            // Clean up the temp file
-            tempFile.delete();
+			// Validate file
+			if (file == null || file.isEmpty()) {
+				result.setStatus(AppConstants.ERROR);
+				return result;
+			}
 
-            result.setExtractedText(extractedText);
-            result.setStatus(AppConstants.SUCCESS);
+			// Validate keys
+			if (keys == null || keys.isEmpty()) {
+				result.setStatus(AppConstants.ERROR);
+				return result;
+			}
 
-        } catch (IOException e) {
-           log.info("Error in processing image::"+e);
-            result.setStatus(AppConstants.ERROR);
-        }
+			// Create temporary file
+			tempFile = File.createTempFile("ocr", ".tmp");
 
-        return result;
-    }
+			// Save uploaded image
+			file.transferTo(tempFile);
 
-    @Override
-    public String searchInText(String extractedText, String keyword) {
-        if (extractedText != null && keyword != null && !keyword.isEmpty()) {
-            if (extractedText.contains(keyword)) {
-                return "Keyword found!";
-            } else {
-                return "Keyword not found.";
-            }
-        }
-        return "Invalid search input.";
-    }
+			// Perform OCR
+			OCRProcessor ocrProcessor = new OCRProcessor();
+
+			String extractedText = ocrProcessor.extractTextFromImage(tempFile);
+
+			// Extract requested key-value pairs
+			Map<String, String> keyValues = extractKeyValues(extractedText, keys);
+
+			// Set response
+			result.setData(keyValues);
+			result.setStatus(AppConstants.SUCCESS);
+
+		} catch (IOException e) {
+
+			log.error("Error in processing image", e);
+
+			result.setStatus(AppConstants.ERROR);
+
+		} catch (Exception e) {
+
+			log.error("Unexpected error in OCR processing", e);
+
+			result.setStatus(AppConstants.ERROR);
+
+		} finally {
+
+			// Delete temporary file
+			if (tempFile != null && tempFile.exists()) {
+				if (!tempFile.delete()) {
+					log.warn("Unable to delete temporary file: {}", tempFile.getAbsolutePath());
+				}
+			}
+		}
+
+		return result;
+	}
+
+	private Map<String, String> extractKeyValues(String extractedText, List<String> keys) {
+
+		Map<String, String> result = new LinkedHashMap<>();
+
+		if (extractedText == null || extractedText.isBlank() || keys == null || keys.isEmpty()) {
+			return result;
+		}
+
+		String[] lines = extractedText.split("\\r?\\n");
+
+		for (String key : keys) {
+
+			if (key == null || key.isBlank()) {
+				continue;
+			}
+
+			String searchKey = key.trim();
+			searchKey = key.trim().replace("\"", "");
+			searchKey = searchKey.contains("[") ? searchKey.substring(1, searchKey.length()) : searchKey;
+			for (String line : lines) {
+
+				line = line.trim();
+
+				if (line.isEmpty()) {
+					continue;
+				}
+
+				/*
+				 * Match key only at the beginning of the line.
+				 *
+				 * Examples:
+				 *
+				 * WBC 6.2 * 109 RBC 3.13 x 191% PCT 0.143 %
+				 */
+
+				if (!(line.toLowerCase().startsWith(searchKey.toLowerCase()))) {
+					continue;
+				}
+
+				// Remove the key from the beginning
+				String remaining = line.substring(searchKey.length()).trim();
+
+				/*
+				 * Extract the first numeric value.
+				 *
+				 * Examples:
+				 *
+				 * 6.2 * 109 -> 6.2 3.13 x 191% -> 3.13 0.143 % -> 0.143 28.8 % -> 28.8
+				 */
+
+				java.util.regex.Matcher matcher = java.util.regex.Pattern.compile("[-+]?\\d+(?:\\.\\d+)?")
+						.matcher(remaining);
+
+				if (matcher.find()) {
+
+					String value = matcher.group();
+
+					result.put(searchKey, value);
+
+					break;
+				}
+			}
+		}
+
+		return result;
+	}
 
 }
