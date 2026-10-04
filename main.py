@@ -1,511 +1,1399 @@
-import os
-import json
-import re
-from typing import Any, Dict, List
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from fastapi.responses import JSONResponse
 
-from fastapi import FastAPI, File, Form, UploadFile
-from pydantic import BaseModel
-from google import genai
-from google.genai import types
+from PIL import Image, ImageEnhance, ImageFilter
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
+import pytesseract
+import io
+import re
+import threading
+import uvicorn
+
+
+# ============================================================
+# FASTAPI APPLICATION
+# ============================================================
+
+app = FastAPI(
+    title="Test Parameter Generator API",
+    description="Generate complete parameter JSON from test report images",
+    version="3.0.0"
+)
 
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+TIMEZONE = ZoneInfo("Asia/Kolkata")
 
-MODEL_NAME = "gemini-3.8-flash"
+TESSERACT_LANG = "eng"
+
+TESSERACT_CONFIG = "--oem 3 --psm 6"
+
+MAX_IMAGE_DIMENSION = 2500
 
 
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY environment variable is not set."
+# ============================================================
+# PARAMETER ID GENERATION
+# ============================================================
+
+parameter_id_lock = threading.Lock()
+
+last_parameter_id = 0
+
+
+def generate_parameter_id():
+
+    global last_parameter_id
+
+    with parameter_id_lock:
+
+        now = datetime.now(TIMEZONE)
+
+        parameter_id = int(
+            now.strftime("%Y%m%d%H%M%S")
+            + f"{now.microsecond // 1000:03d}"
+        )
+
+        if parameter_id <= last_parameter_id:
+
+            parameter_id = last_parameter_id + 1
+
+        last_parameter_id = parameter_id
+
+        return parameter_id
+
+
+# ============================================================
+# CURRENT DATETIME
+# ============================================================
+
+def get_current_datetime():
+
+    return datetime.now(
+        TIMEZONE
+    ).strftime(
+        "%Y-%m-%d %H:%M:%S"
     )
 
 
-# Gemini client
-client = genai.Client(api_key=GEMINI_API_KEY)
+# ============================================================
+# IMAGE PREPROCESSING
+# ============================================================
+
+def preprocess_image(image: Image.Image):
+
+    image = image.convert("RGB")
+
+    width, height = image.size
+
+    # --------------------------------------------------------
+    # Resize if required
+    # --------------------------------------------------------
+
+    if (
+        width > MAX_IMAGE_DIMENSION
+        or
+        height > MAX_IMAGE_DIMENSION
+    ):
+
+        scale = min(
+            MAX_IMAGE_DIMENSION / width,
+            MAX_IMAGE_DIMENSION / height
+        )
+
+        new_width = max(
+            1,
+            int(width * scale)
+        )
+
+        new_height = max(
+            1,
+            int(height * scale)
+        )
+
+        image = image.resize(
+            (
+                new_width,
+                new_height
+            ),
+            Image.Resampling.LANCZOS
+        )
+
+    # --------------------------------------------------------
+    # Improve contrast
+    # --------------------------------------------------------
+
+    image = ImageEnhance.Contrast(
+        image
+    ).enhance(1.25)
+
+    # --------------------------------------------------------
+    # Sharpen
+    # --------------------------------------------------------
+
+    image = image.filter(
+        ImageFilter.SHARPEN
+    )
+
+    return image
 
 
 # ============================================================
-# FASTAPI
+# CLEAN OCR TEXT
 # ============================================================
 
-app = FastAPI(
-    title="Gemini OCR API",
-    version="1.0.0"
-)
+def clean_ocr_text(text):
 
+    if text is None:
 
-# ============================================================
-# RESPONSE MODEL
-# ============================================================
-
-class OCRResponse(BaseModel):
-    status: str
-    data: Dict[str, str]
-
-
-# ============================================================
-# HEALTH CHECK
-# ============================================================
-
-@app.get("/health")
-def health():
-    return {
-        "status": "SUCCESS",
-        "message": "Gemini OCR API is running"
-    }
-
-
-# ============================================================
-# KEY NORMALIZATION
-# ============================================================
-
-def normalize_key(key: str) -> str:
-    """
-    Normalize keys only for comparison.
-
-    Examples:
-
-    LYMPH%   -> LYMPH
-    LYMPH %  -> LYMPH
-    RDW-CV   -> RDWCV
-    RDW CV   -> RDWCV
-    """
-
-    if key is None:
         return ""
 
-    key = str(key).strip().upper()
+    text = text.replace(
+        "\t",
+        " "
+    )
 
-    # Remove spaces
-    key = key.replace(" ", "")
+    text = re.sub(
+        r"\s+",
+        " ",
+        text
+    )
 
-    # Remove hyphens
-    key = key.replace("-", "")
-
-    # Remove underscores
-    key = key.replace("_", "")
-
-    # Keep % out of comparison
-    key = key.replace("%", "")
-
-    return key
+    return text.strip()
 
 
 # ============================================================
-# PARSE KEYS
+# VALID OCR TEXT
 # ============================================================
 
-def parse_keys(keys: str) -> List[str]:
-    """
-    Supports:
-
-    ["WBC","HGB","RBC"]
-
-    and:
-
-    [["WBC","HGB","RBC"]]
-    """
-
-    try:
-        parsed = json.loads(keys)
-
-    except Exception as e:
-        raise ValueError(
-            f"Invalid keys JSON: {str(e)}"
-        )
-
-    # Nested list
-    if (
-        isinstance(parsed, list)
-        and len(parsed) > 0
-        and isinstance(parsed[0], list)
-    ):
-        parsed = parsed[0]
-
-    if not isinstance(parsed, list):
-        raise ValueError(
-            "keys must be a JSON array"
-        )
-
-    result = []
-
-    for key in parsed:
-
-        if key is None:
-            continue
-
-        key = str(key).strip()
-
-        if key:
-            result.append(key)
-
-    if not result:
-        raise ValueError(
-            "No valid keys supplied"
-        )
-
-    return result
-
-
-# ============================================================
-# CLEAN GEMINI RESPONSE
-# ============================================================
-
-def clean_json_response(text: str) -> Dict[str, Any]:
-    """
-    Convert Gemini response into JSON object.
-
-    Handles:
-
-    {
-        "WBC": "5.2"
-    }
-
-    and markdown:
-
-    ```json
-    {
-        "WBC": "5.2"
-    }
-    ```
-    """
+def is_valid_ocr_text(text):
 
     if not text:
-        raise ValueError(
-            "Gemini returned an empty response"
+
+        return False
+
+    return bool(
+        re.search(
+            r"[A-Za-z0-9]",
+            text
         )
-
-    text = text.strip()
-
-    # Remove markdown code fence
-    text = re.sub(
-        r"^```json\s*",
-        "",
-        text,
-        flags=re.IGNORECASE
     )
 
-    text = re.sub(
-        r"^```\s*",
-        "",
-        text
+
+# ============================================================
+# OCR DATA
+# ============================================================
+
+def extract_ocr_data(image: Image.Image):
+
+    processed_image = preprocess_image(
+        image
     )
 
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text
-    )
-
-    text = text.strip()
-
-    # Try direct JSON
     try:
 
-        parsed = json.loads(text)
+        data = pytesseract.image_to_data(
+            processed_image,
+            lang=TESSERACT_LANG,
+            config=TESSERACT_CONFIG,
+            output_type=pytesseract.Output.DICT
+        )
 
-        if isinstance(parsed, dict):
-            return parsed
+    except Exception as e:
 
-    except json.JSONDecodeError:
-        pass
+        raise RuntimeError(
+            f"Tesseract OCR failed: {str(e)}"
+        )
 
-    # Try extracting JSON object
+    words = []
+
+    total_items = len(
+        data["text"]
+    )
+
+    for i in range(total_items):
+
+        text = clean_ocr_text(
+            data["text"][i]
+        )
+
+        if not text:
+
+            continue
+
+        if not is_valid_ocr_text(
+            text
+        ):
+
+            continue
+
+        try:
+
+            confidence = float(
+                data["conf"][i]
+            )
+
+        except Exception:
+
+            confidence = -1
+
+        # Ignore extremely low confidence text
+        if confidence >= 0 and confidence < 10:
+
+            continue
+
+        words.append({
+
+            "text":
+                text,
+
+            "x":
+                int(data["left"][i]),
+
+            "y":
+                int(data["top"][i]),
+
+            "width":
+                int(data["width"][i]),
+
+            "height":
+                int(data["height"][i]),
+
+            "conf":
+                confidence
+        })
+
+    return words
+
+
+# ============================================================
+# GROUP OCR WORDS INTO ROWS
+# ============================================================
+
+def group_words_into_rows(words):
+
+    if not words:
+
+        return []
+
+    words = sorted(
+        words,
+        key=lambda item: (
+            item["y"],
+            item["x"]
+        )
+    )
+
+    rows = []
+
+    for word in words:
+
+        word_center_y = (
+            word["y"]
+            +
+            word["height"] / 2
+        )
+
+        matched_row = None
+
+        for row in rows:
+
+            tolerance = max(
+                8,
+                row["average_height"] * 0.65
+            )
+
+            if abs(
+                word_center_y
+                -
+                row["center_y"]
+            ) <= tolerance:
+
+                matched_row = row
+
+                break
+
+        if matched_row is not None:
+
+            matched_row["words"].append(
+                word
+            )
+
+            count = len(
+                matched_row["words"]
+            )
+
+            matched_row["center_y"] = (
+
+                (
+                    matched_row["center_y"]
+                    *
+                    (count - 1)
+                )
+                +
+                word_center_y
+
+            ) / count
+
+            matched_row["average_height"] = (
+
+                sum(
+                    item["height"]
+                    for item
+                    in matched_row["words"]
+                )
+                /
+                count
+            )
+
+        else:
+
+            rows.append({
+
+                "center_y":
+                    word_center_y,
+
+                "average_height":
+                    word["height"],
+
+                "words":
+                    [word]
+            })
+
+    rows.sort(
+        key=lambda row: row["center_y"]
+    )
+
+    for row in rows:
+
+        row["words"].sort(
+            key=lambda item: item["x"]
+        )
+
+    return rows
+
+
+# ============================================================
+# COLUMN TEXT
+# ============================================================
+
+def get_column_text(words):
+
+    if not words:
+
+        return ""
+
+    words = sorted(
+        words,
+        key=lambda item: item["x"]
+    )
+
+    return clean_ocr_text(
+        " ".join(
+            word["text"]
+            for word in words
+        )
+    )
+
+
+# ============================================================
+# DETECT FOUR COLUMNS
+# ============================================================
+
+def detect_columns(
+    row,
+    image_width
+):
+    """
+    Four columns:
+
+        1 = Parameter Name
+        2 = Value
+        3 = Unit
+        4 = Reference Range
+    """
+
+    column_1 = []
+    column_2 = []
+    column_3 = []
+    column_4 = []
+
+    # --------------------------------------------------------
+    # Column boundaries
+    # --------------------------------------------------------
+
+    boundary_1 = image_width * 0.45
+
+    boundary_2 = image_width * 0.65
+
+    boundary_3 = image_width * 0.78
+
+    for word in row["words"]:
+
+        center_x = (
+            word["x"]
+            +
+            word["width"] / 2
+        )
+
+        if center_x < boundary_1:
+
+            column_1.append(
+                word
+            )
+
+        elif center_x < boundary_2:
+
+            column_2.append(
+                word
+            )
+
+        elif center_x < boundary_3:
+
+            column_3.append(
+                word
+            )
+
+        else:
+
+            column_4.append(
+                word
+            )
+
+    return (
+        column_1,
+        column_2,
+        column_3,
+        column_4
+    )
+
+
+# ============================================================
+# RANGE PARSER
+# ============================================================
+
+def parse_range(text):
+
+    if not text:
+
+        return {
+
+            "lowerRange":
+                None,
+
+            "parameterRange":
+                None,
+
+            "upperRange":
+                None
+        }
+
+    normalized = text
+
+    normalized = normalized.replace(
+        "–",
+        "-"
+    )
+
+    normalized = normalized.replace(
+        "—",
+        "-"
+    )
+
+    normalized = normalized.replace(
+        "−",
+        "-"
+    )
+
+    normalized = re.sub(
+        r"\s+",
+        " ",
+        normalized
+    ).strip()
+
+    # --------------------------------------------------------
+    # Example:
+    #
+    # 12 - 17
+    # 12.0 - 17.0
+    # --------------------------------------------------------
+
     match = re.search(
-        r"\{.*\}",
-        text,
-        flags=re.DOTALL
+        r"(-?\d+(?:\.\d+)?)\s*-\s*(-?\d+(?:\.\d+)?)",
+        normalized
     )
 
     if match:
 
-        json_text = match.group(0)
-
-        try:
-
-            parsed = json.loads(json_text)
-
-            if isinstance(parsed, dict):
-                return parsed
-
-        except json.JSONDecodeError as e:
-
-            raise ValueError(
-                f"Invalid JSON returned by Gemini: {str(e)}"
-            )
-
-    raise ValueError(
-        "Gemini response does not contain a valid JSON object"
-    )
-
-
-# ============================================================
-# FIND VALUE FOR REQUESTED KEY
-# ============================================================
-
-def find_value_for_key(
-    gemini_data: Dict[str, Any],
-    requested_key: str
-) -> str:
-
-    requested_normalized = normalize_key(
-        requested_key
-    )
-
-    for response_key, value in gemini_data.items():
-
-        response_normalized = normalize_key(
-            str(response_key)
+        lower = float(
+            match.group(1)
         )
 
-        if response_normalized == requested_normalized:
+        upper = float(
+            match.group(2)
+        )
 
-            if value is None:
-                return ""
+        return {
 
-            return str(value).strip()
+            "lowerRange":
+                lower,
 
-    return ""
+            "parameterRange":
+                normalized,
 
+            "upperRange":
+                upper
+        }
 
-# ============================================================
-# CREATE GEMINI PROMPT
-# ============================================================
+    # --------------------------------------------------------
+    # Example:
+    #
+    # 12 to 17
+    # --------------------------------------------------------
 
-def create_prompt(
-    requested_keys: List[str],
-    column_count: int
-) -> str:
-
-    keys_json = json.dumps(
-        requested_keys,
-        ensure_ascii=False
+    match = re.search(
+        r"(-?\d+(?:\.\d+)?)\s+to\s+(-?\d+(?:\.\d+)?)",
+        normalized,
+        re.IGNORECASE
     )
 
-    prompt = f"""
-You are an OCR extraction engine for pathology and laboratory analyzer reports.
+    if match:
 
-You will receive an image containing laboratory test results.
+        lower = float(
+            match.group(1)
+        )
 
-Your task is to extract ONLY the requested keys.
+        upper = float(
+            match.group(2)
+        )
 
-REQUESTED KEYS:
-{keys_json}
+        return {
 
-COLUMN COUNT:
-{column_count}
+            "lowerRange":
+                lower,
 
-IMPORTANT LAYOUT RULE:
+            "parameterRange":
+                normalized,
 
-The image can contain multiple key-value columns on the same physical row.
+            "upperRange":
+                upper
+        }
 
-columnCount = {column_count}
+    # --------------------------------------------------------
+    # > 5
+    # --------------------------------------------------------
 
-means that each physical row can contain up to {column_count} key-value columns.
+    match = re.search(
+        r">\s*(-?\d+(?:\.\d+)?)",
+        normalized
+    )
 
-For example, if columnCount = 2:
+    if match:
 
-WBC     5.2        HGB     10.7
+        value = float(
+            match.group(1)
+        )
 
-This is ONE physical row containing TWO key-value columns.
+        return {
 
-Therefore:
+            "lowerRange":
+                value,
 
-WBC -> 5.2
-HGB -> 10.7
+            "parameterRange":
+                normalized,
 
-Do NOT associate a value from another column with the wrong key.
+            "upperRange":
+                None
+        }
 
-Read the image:
+    # --------------------------------------------------------
+    # < 10
+    # --------------------------------------------------------
 
-1. From top to bottom.
-2. Within each row, from left to right.
-3. Treat each key and its nearby value as one key-value pair.
-4. Respect the physical position of the text in the image.
-5. Do not reorder values based only on OCR text order.
-6. Use the nearest corresponding value belonging to each key.
+    match = re.search(
+        r"<\s*(-?\d+(?:\.\d+)?)",
+        normalized
+    )
 
-KEY MATCHING RULES:
+    if match:
 
-Keys may appear with small formatting differences.
+        value = float(
+            match.group(1)
+        )
 
-Examples:
+        return {
 
-LYMPH% and LYMPH % are the same key.
+            "lowerRange":
+                None,
 
-RDW-CV and RDW CV are the same key.
+            "parameterRange":
+                normalized,
 
-RDW-CV and RDW-CV% should NOT automatically be treated as the same
-unless the image clearly shows that they represent the requested field.
+            "upperRange":
+                value
+        }
 
-Ignore spaces when matching keys.
+    return {
 
-Ignore hyphens and underscores when matching keys.
+        "lowerRange":
+            None,
 
-The report may contain H or L flags between the key and value.
+        "parameterRange":
+            normalized,
 
-For example:
-
-WBC 5.2
-WBC H 5.2
-WBC L 5.2
-
-In all cases:
-
-WBC -> 5.2
-
-The H/L flag is NOT part of the value.
-
-Do not include:
-
-H
-L
-HIGH
-LOW
-*
-flags
-reference ranges
-units
-
-unless they are actually part of the requested value.
-
-VALUE RULES:
-
-Return the actual result value associated with the requested key.
-
-Examples:
-
-WBC 5.2 -> "5.2"
-
-HGB 10.7 -> "10.7"
-
-RBC 4.03 -> "4.03"
-
-PLT 171 -> "171"
-
-Do not return reference ranges.
-
-Example:
-
-WBC 5.2 4.0-10.0
-
-Return:
-
-"WBC": "5.2"
-
-NOT:
-
-"WBC": "5.2 4.0-10.0"
-
-If a requested key cannot be found confidently, return an empty string.
-
-Do not guess.
-
-OUTPUT REQUIREMENT:
-
-Return ONLY a valid JSON object.
-
-Do NOT return:
-
-- markdown
-- ```json
-- explanations
-- comments
-- arrays
-- additional fields
-
-The JSON object must contain ONLY the requested keys.
-
-Example:
-
-{{
-    "WBC": "5.2",
-    "HGB": "10.7",
-    "RBC": "4.03"
-}}
-
-If a value cannot be found:
-
-{{
-    "WBC": "5.2",
-    "HGB": "",
-    "RBC": "4.03"
-}}
-
-VERY IMPORTANT:
-
-Return every requested key exactly as provided in REQUESTED KEYS.
-
-Do not rename the keys.
-
-Do not add keys that were not requested.
-"""
-
-    return prompt
+        "upperRange":
+            None
+    }
 
 
 # ============================================================
-# OCR ENDPOINT
+# PARSE ONE ROW
+# ============================================================
+
+def parse_ocr_row(
+    row,
+    image_width
+):
+    """
+    Convert one image row into:
+
+        parameterName
+        value
+        unit
+        reference range
+    """
+
+    (
+        column_1,
+        column_2,
+        column_3,
+        column_4
+    ) = detect_columns(
+        row,
+        image_width
+    )
+
+    parameter_name = get_column_text(
+        column_1
+    )
+
+    value = get_column_text(
+        column_2
+    )
+
+    unit = get_column_text(
+        column_3
+    )
+
+    range_text = get_column_text(
+        column_4
+    )
+
+    # --------------------------------------------------------
+    # If column 4 was not detected correctly,
+    # find range from row text.
+    # --------------------------------------------------------
+
+    if not range_text:
+
+        full_row_text = get_column_text(
+            row["words"]
+        )
+
+        match = re.search(
+            r"(-?\d+(?:\.\d+)?)\s*[-–—−]\s*(-?\d+(?:\.\d+)?)",
+            full_row_text
+        )
+
+        if match:
+
+            range_text = match.group(0)
+
+    range_data = parse_range(
+        range_text
+    )
+
+    return {
+
+        "parameterName":
+            parameter_name,
+
+        "value":
+            value,
+
+        "unit":
+            unit,
+
+        "lowerRange":
+            range_data["lowerRange"],
+
+        "parameterRange":
+            range_data["parameterRange"],
+
+        "upperRange":
+            range_data["upperRange"]
+    }
+
+
+# ============================================================
+# CHECK HEADER ROW
+# ============================================================
+
+def is_header_row(row):
+
+    full_text = get_column_text(
+        row["words"]
+    ).lower()
+
+    full_text = re.sub(
+        r"\s+",
+        " ",
+        full_text
+    ).strip()
+
+    # --------------------------------------------------------
+    # Common headers
+    # --------------------------------------------------------
+
+    headers = [
+
+        "test name result unit reference range",
+
+        "test name result unit reference",
+
+        "parameter value unit reference range",
+
+        "parameter result unit reference range",
+
+        "test result unit reference range",
+
+        "investigation result unit reference range",
+
+        "test name",
+
+        "parameter name",
+
+        "parameter result",
+
+        "reference range"
+    ]
+
+    for header in headers:
+
+        if full_text == header:
+
+            return True
+
+    # --------------------------------------------------------
+    # Detect header by keywords
+    # --------------------------------------------------------
+
+    has_test = (
+        "test" in full_text
+        or
+        "parameter" in full_text
+        or
+        "investigation" in full_text
+    )
+
+    has_result = (
+        "result" in full_text
+        or
+        "value" in full_text
+    )
+
+    has_unit = (
+        "unit" in full_text
+    )
+
+    has_range = (
+        "range" in full_text
+        or
+        "reference" in full_text
+    )
+
+    if (
+        has_test
+        and
+        has_result
+        and
+        has_unit
+        and
+        has_range
+    ):
+
+        return True
+
+    return False
+
+
+# ============================================================
+# VALID PARAMETER ROW
+# ============================================================
+
+def is_valid_parameter_row(
+    parsed_row
+):
+
+    parameter_name = (
+        parsed_row["parameterName"]
+    )
+
+    if not parameter_name:
+
+        return False
+
+    # --------------------------------------------------------
+    # Ignore obvious headers
+    # --------------------------------------------------------
+
+    name = parameter_name.lower()
+
+    name = re.sub(
+        r"\s+",
+        " ",
+        name
+    ).strip()
+
+    ignored = {
+
+        "parameter",
+
+        "parameters",
+
+        "test",
+
+        "test name",
+
+        "investigation",
+
+        "investigations",
+
+        "name",
+
+        "result",
+
+        "results",
+
+        "value",
+
+        "unit",
+
+        "reference",
+
+        "reference range",
+
+        "normal range"
+    }
+
+    if name in ignored:
+
+        return False
+
+    return True
+
+
+# ============================================================
+# EXTRACT TABLE ROWS
+# ============================================================
+
+def extract_table_rows(
+    image: Image.Image
+):
+
+    processed_image = preprocess_image(
+        image
+    )
+
+    image_width, image_height = (
+        processed_image.size
+    )
+
+    # --------------------------------------------------------
+    # OCR
+    # --------------------------------------------------------
+
+    words = extract_ocr_data(
+        processed_image
+    )
+
+    if not words:
+
+        return []
+
+    # --------------------------------------------------------
+    # Group into rows
+    # --------------------------------------------------------
+
+    rows = group_words_into_rows(
+        words
+    )
+
+    table_rows = []
+
+    previous_parameter = None
+
+    for row in rows:
+
+        # ----------------------------------------------------
+        # Skip table header
+        # ----------------------------------------------------
+
+        if is_header_row(row):
+
+            continue
+
+        # ----------------------------------------------------
+        # Parse row
+        # ----------------------------------------------------
+
+        parsed_row = parse_ocr_row(
+            row,
+            image_width
+        )
+
+        # ----------------------------------------------------
+        # Validate
+        # ----------------------------------------------------
+
+        if not is_valid_parameter_row(
+            parsed_row
+        ):
+
+            continue
+
+        parameter_name = (
+            parsed_row["parameterName"]
+        )
+
+        # ----------------------------------------------------
+        # Avoid duplicate consecutive rows
+        # ----------------------------------------------------
+
+        if (
+            previous_parameter
+            and
+            parameter_name.lower()
+            ==
+            previous_parameter.lower()
+        ):
+
+            continue
+
+        table_rows.append(
+            parsed_row
+        )
+
+        previous_parameter = (
+            parameter_name
+        )
+
+    return table_rows
+
+
+# ============================================================
+# CREATE COMPLETE PARAMETER OBJECT
+# ============================================================
+
+def create_parameter_object(
+    parameter_name,
+    value,
+    unit,
+    lower_range,
+    parameter_range,
+    upper_range,
+    code,
+    sequence
+):
+
+    current_datetime = (
+        get_current_datetime()
+    )
+
+    return {
+
+        # ----------------------------------------------------
+        # BASIC
+        # ----------------------------------------------------
+
+        "parameterId":
+            generate_parameter_id(),
+
+        "parameterName":
+            parameter_name,
+
+        "code":
+            code,
+
+        "value":
+            value,
+
+        "sequence":
+            sequence,
+
+        "dataType":
+            "String",
+
+        "unit":
+            unit,
+
+        # ----------------------------------------------------
+        # CRITERIA
+        # ----------------------------------------------------
+
+        "criteria":
+            "Normal",
+
+        "defaultVlue":
+            "",
+
+        "formula":
+            "",
+
+        # ----------------------------------------------------
+        # RANGE
+        # ----------------------------------------------------
+
+        "upperRange":
+            upper_range,
+
+        "lowerRange":
+            lower_range,
+
+        "extrimUpperRange":
+            0.0,
+
+        "extrimLowerRange":
+            0.0,
+
+        "lowerAgeRange":
+            0.0,
+
+        "upperAgeRange":
+            0.0,
+
+        # ----------------------------------------------------
+        # METHOD
+        # ----------------------------------------------------
+
+        "method":
+            "",
+
+        "context":
+            "",
+
+        # ----------------------------------------------------
+        # DISPLAY
+        # ----------------------------------------------------
+
+        "isHideLable":
+            False,
+
+        "isHideLableOnRemport":
+            False,
+
+        "isLocalDictonery":
+            False,
+
+        "isWrapper":
+            False,
+
+        "isCalculative":
+            False,
+
+        "isImageResize":
+            False,
+
+        "isBold":
+            True,
+
+        "isNameBold":
+            False,
+
+        "isDescriptionParameter":
+            False,
+
+        # ----------------------------------------------------
+        # OTHER
+        # ----------------------------------------------------
+
+        "position":
+            None,
+
+        "parameterRange":
+            parameter_range,
+
+        "isValueRequired":
+            True,
+
+        "lineCount":
+            None,
+
+        "isValueDiscription":
+            False,
+
+        # ----------------------------------------------------
+        # AUDIT
+        # ----------------------------------------------------
+
+        "createdBy":
+            101,
+
+        "updatedBy":
+            102,
+
+        "createdAt":
+            current_datetime,
+
+        "updatedAt":
+            current_datetime
+    }
+
+
+# ============================================================
+# GENERATE FINAL PARAMETER LIST
+# ============================================================
+
+def generate_parameter_list(
+    table_rows,
+    code
+):
+
+    parameters = []
+
+    sequence = 3
+
+    for row in table_rows:
+
+        parameter = create_parameter_object(
+
+            parameter_name=
+                row["parameterName"],
+
+            value=
+                row["value"],
+
+            unit=
+                row["unit"],
+
+            lower_range=
+                row["lowerRange"],
+
+            parameter_range=
+                row["parameterRange"],
+
+            upper_range=
+                row["upperRange"],
+
+            code=
+                code,
+
+            sequence=
+                sequence
+        )
+
+        parameters.append(
+            parameter
+        )
+
+        sequence += 1
+
+    return parameters
+
+
+# ============================================================
+# ROOT
+# ============================================================
+
+@app.get("/")
+def root():
+
+    return {
+
+        "status":
+            "UP",
+
+        "service":
+            "Test Parameter Generator API",
+
+        "mainEndpoint":
+            "/api/parameters/generate"
+    }
+
+
+# ============================================================
+# HEALTH
+# ============================================================
+
+@app.get("/health")
+def health():
+
+    return {
+
+        "status":
+            "UP"
+    }
+
+
+# ============================================================
+# MAIN API
 # ============================================================
 
 @app.post(
-    "/extract",
-    response_model=OCRResponse
+    "/api/parameters/generate"
 )
-async def extract(
+async def generate_parameters_api(
+
     image: UploadFile = File(...),
-    keys: str = Form(...),
-    columnCount: int = Form(...)
+
+    code: str = Form(...)
 ):
 
-    print()
-    print("=" * 70)
-    print("NEW OCR REQUEST")
-    print("=" * 70)
+    # ========================================================
+    # VALIDATE CODE
+    # ========================================================
 
-    # --------------------------------------------------------
-    # Validate columnCount
-    # --------------------------------------------------------
+    if code is None:
 
-    if columnCount <= 0:
-
-        print("ERROR: columnCount must be greater than 0")
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
+        raise HTTPException(
+            status_code=400,
+            detail="code is required"
         )
 
-    # --------------------------------------------------------
-    # Parse keys
-    # --------------------------------------------------------
+    code = code.strip()
+
+    if not code:
+
+        raise HTTPException(
+            status_code=400,
+            detail="code cannot be empty"
+        )
+
+    # ========================================================
+    # VALIDATE IMAGE
+    # ========================================================
+
+    if image is None:
+
+        raise HTTPException(
+            status_code=400,
+            detail="image is required"
+        )
+
+    if not image.filename:
+
+        raise HTTPException(
+            status_code=400,
+            detail="Image filename is missing"
+        )
+
+    # ========================================================
+    # READ IMAGE
+    # ========================================================
 
     try:
 
-        requested_keys = parse_keys(keys)
+        image_bytes = await image.read()
+
+        if not image_bytes:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded image is empty"
+            )
+
+        pil_image = Image.open(
+            io.BytesIO(
+                image_bytes
+            )
+        )
+
+        pil_image.load()
+
+    except HTTPException:
+
+        raise
 
     except Exception as e:
 
-        print("=" * 70)
-        print("KEY PARSING ERROR")
-        print(type(e).__name__)
-        print(str(e))
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid image: {str(e)}"
         )
 
-    print("Requested keys:")
-    print(requested_keys)
+    # ========================================================
+    # OCR / TABLE EXTRACTION
+    # ========================================================
 
-    print("Column count:")
-    print(columnCount)
+    try:
+
+        table_rows = extract_table_rows(
+            pil_image
+        )
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
+
+    # ========================================================
+    # NO DATA
+    # ========================================================
+
+    if not table_rows:
+
+        return JSONResponse(
+            status_code=200,
+            content=[]
+        )
+
+    # ========================================================
+    # GENERATE COMPLETE JSON OBJECTS
+    # ========================================================
+
+    parameters = generate_parameter_list(
+        table_rows=table_rows,
+        code=code
+    )
+
+    # ========================================================
+    # RETURN FULL JSON ARRAY
+    # ========================================================
+
+    return JSONResponse(
+        status_code=200,
+        content=parameters
+    )
+
+
+# ============================================================
+# DEBUG API
+# ============================================================
+
+@app.post(
+    "/api/parameters/generate/debug"
+)
+async def generate_parameters_debug_api(
+
+    image: UploadFile = File(...),
+
+    code: str = Form(...)
+):
+
+    if code is None or not code.strip():
+
+        raise HTTPException(
+            status_code=400,
+            detail="code is required"
+        )
+
+    code = code.strip()
 
     # --------------------------------------------------------
     # Read image
@@ -515,238 +1403,87 @@ async def extract(
 
         image_bytes = await image.read()
 
+        if not image_bytes:
+
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded image is empty"
+            )
+
+        pil_image = Image.open(
+            io.BytesIO(
+                image_bytes
+            )
+        )
+
+        pil_image.load()
+
+    except HTTPException:
+
+        raise
+
     except Exception as e:
 
-        print("=" * 70)
-        print("IMAGE READ ERROR")
-        print(type(e).__name__)
-        print(str(e))
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid image: {str(e)}"
         )
 
-    if not image_bytes:
+    # --------------------------------------------------------
+    # Extract table
+    # --------------------------------------------------------
 
-        print("ERROR: Empty image")
+    try:
 
-        return OCRResponse(
-            status="ERROR",
-            data={}
+        table_rows = extract_table_rows(
+            pil_image
         )
 
-    print("Image filename:")
-    print(image.filename)
+    except Exception as e:
 
-    print("Image content type:")
-    print(image.content_type)
-
-    print("Image size:")
-    print(len(image_bytes), "bytes")
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
+        )
 
     # --------------------------------------------------------
-    # Validate MIME type
+    # Generate parameters
     # --------------------------------------------------------
 
-    allowed_types = {
-        "image/jpeg",
-        "image/jpg",
-        "image/png",
-        "image/webp"
+    parameters = generate_parameter_list(
+        table_rows=table_rows,
+        code=code
+    )
+
+    # --------------------------------------------------------
+    # Debug response
+    # --------------------------------------------------------
+
+    return {
+
+        "code":
+            code,
+
+        "rows":
+            table_rows,
+
+        "parameterCount":
+            len(parameters),
+
+        "parameters":
+            parameters
     }
 
-    if image.content_type not in allowed_types:
 
-        print(
-            "ERROR: Unsupported image type:",
-            image.content_type
-        )
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # --------------------------------------------------------
-    # Create prompt
-    # --------------------------------------------------------
-
-    prompt = create_prompt(
-        requested_keys,
-        columnCount
-    )
-
-    print()
-    print("Gemini prompt created.")
-    print("Model:", MODEL_NAME)
-
-    # --------------------------------------------------------
-    # Call Gemini
-    # --------------------------------------------------------
-
-    try:
-
-        print()
-        print("=" * 70)
-        print("CALLING GEMINI")
-        print("=" * 70)
-
-        response = client.models.generate_content(
-
-            model=MODEL_NAME,
-
-            contents=[
-
-                types.Part.from_text(
-                    text=prompt
-                ),
-
-                types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type=image.content_type
-                )
-            ],
-
-            config=types.GenerateContentConfig(
-
-                temperature=0,
-
-                response_mime_type="application/json"
-            )
-        )
-
-        print()
-        print("=" * 70)
-        print("GEMINI RESPONSE RECEIVED")
-        print("=" * 70)
-
-        response_text = response.text
-
-        print(response_text)
-
-        print("=" * 70)
-
-    except Exception as e:
-
-        print()
-        print("=" * 70)
-        print("GEMINI ERROR")
-        print("=" * 70)
-
-        print("Error type:")
-        print(type(e).__name__)
-
-        print("Error:")
-        print(str(e))
-
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # --------------------------------------------------------
-    # Parse Gemini JSON
-    # --------------------------------------------------------
-
-    try:
-
-        print()
-        print("=" * 70)
-        print("PARSING GEMINI JSON")
-        print("=" * 70)
-
-        gemini_data = clean_json_response(
-            response_text
-        )
-
-        print("Parsed Gemini data:")
-        print(
-            json.dumps(
-                gemini_data,
-                indent=4,
-                ensure_ascii=False
-            )
-        )
-
-        print("=" * 70)
-
-    except Exception as e:
-
-        print()
-        print("=" * 70)
-        print("JSON PARSING ERROR")
-        print("=" * 70)
-
-        print("Error type:")
-        print(type(e).__name__)
-
-        print("Error:")
-        print(str(e))
-
-        print("Gemini raw response:")
-        print(response_text)
-
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # --------------------------------------------------------
-    # Build final response
-    # --------------------------------------------------------
-
-    final_data = {}
-
-    for requested_key in requested_keys:
-
-        value = find_value_for_key(
-            gemini_data,
-            requested_key
-        )
-
-        final_data[requested_key] = value
-
-    # --------------------------------------------------------
-    # Print final result
-    # --------------------------------------------------------
-
-    print()
-    print("=" * 70)
-    print("FINAL OCR RESULT")
-    print("=" * 70)
-
-    print(
-        json.dumps(
-            final_data,
-            indent=4,
-            ensure_ascii=False
-        )
-    )
-
-    print("=" * 70)
-    print()
-
-    # --------------------------------------------------------
-    # SUCCESS
-    # --------------------------------------------------------
-
-    return OCRResponse(
-        status="SUCCESS",
-        data=final_data
-    )
+# ============================================================
+# START SERVER
+# ============================================================
 
 if __name__ == "__main__":
-    import uvicorn
 
     uvicorn.run(
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True
+        reload=False
     )
