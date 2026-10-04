@@ -4,4 +4,5 @@ python-multipart
 google-genai
 pydantic
 protobuf
-google-genai
+Pillow
+
