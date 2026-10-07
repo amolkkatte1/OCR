@@ -1,18 +1,14 @@
 import os
-import json
-import re
 import io
+import json
+import logging
+from typing import List
 
-from typing import Any, Dict, List
-
-from fastapi import FastAPI, File, Form, UploadFile
-from pydantic import BaseModel
-
+from fastapi import FastAPI, File, Form, UploadFile, HTTPException
 from PIL import Image, ImageOps
-
 from google import genai
 from google.genai import types
-
+from pydantic import BaseModel
 
 # ============================================================
 # CONFIGURATION
@@ -20,358 +16,175 @@ from google.genai import types
 
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-MODEL_NAME = "gemini-3.8-flash"
+if not GEMINI_API_KEY:
+    raise RuntimeError("GEMINI_API_KEY environment variable is not set")
 
-# Low thinking = lower cost + lower latency
-# Gemini 3.8 Flash supports: low, medium, high
-THINKING_LEVEL = "low"
+# Gemini model
+MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
 
-# Maximum dimension sent to Gemini
-MAX_IMAGE_DIMENSION = 2500
+# Maximum image dimension sent to Gemini.
+# 768 is a good starting point for cost reduction.
+MAX_IMAGE_DIMENSION = int(os.getenv("OCR_MAX_IMAGE_DIMENSION", "768"))
 
-# Target maximum image size
-MAX_IMAGE_SIZE = 500 * 1024  # 500 KB
+# Target JPEG size.
+# This is only a local optimization; Gemini image-token cost is
+# primarily affected by image resolution rather than raw JPEG KB.
+TARGET_IMAGE_KB = int(os.getenv("OCR_TARGET_IMAGE_KB", "100"))
 
 # JPEG quality range
-JPEG_START_QUALITY = 85
-JPEG_MIN_QUALITY = 55
-JPEG_QUALITY_STEP = 5
+JPEG_START_QUALITY = 82
+JPEG_MIN_QUALITY = 60
 
+# ============================================================
+# LOGGING
+# ============================================================
 
-if not GEMINI_API_KEY:
-    raise RuntimeError(
-        "GEMINI_API_KEY environment variable is not set."
-    )
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("ocr")
 
+# ============================================================
+# GEMINI CLIENT
+# ============================================================
 
-# Gemini client
-client = genai.Client(
-    api_key=GEMINI_API_KEY
-)
-
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # ============================================================
 # FASTAPI
 # ============================================================
 
 app = FastAPI(
-    title="Gemini OCR API",
-    version="1.1.0"
+    title="Pathology OCR API",
+    version="2.0.0"
 )
-
 
 # ============================================================
 # RESPONSE MODEL
 # ============================================================
 
 class OCRResponse(BaseModel):
-    status: str
-    data: Dict[str, str]
+    WBC: str
+    LYMPH_percent: str = ""
+    GRAN_percent: str = ""
+    HGB: str
+    RBC: str
+    HCT: str
+    RDW_CV: str
+    PLT: str
 
 
 # ============================================================
-# HEALTH CHECK
+# REQUESTED KEYS
 # ============================================================
 
-@app.get("/health")
-def health():
-    return {
-        "status": "SUCCESS",
-        "message": "Gemini OCR API is running"
-    }
-
-
-# ============================================================
-# KEY NORMALIZATION
-# ============================================================
-
-def normalize_key(key: str) -> str:
-    """
-    Normalize keys only for comparison.
-
-    Examples:
-
-    LYMPH%   -> LYMPH
-    LYMPH %  -> LYMPH
-    RDW-CV   -> RDWCV
-    RDW CV   -> RDWCV
-    """
-
-    if key is None:
-        return ""
-
-    key = str(key).strip().upper()
-
-    # Remove spaces
-    key = key.replace(" ", "")
-
-    # Remove hyphens
-    key = key.replace("-", "")
-
-    # Remove underscores
-    key = key.replace("_", "")
-
-    # Keep % out of comparison
-    key = key.replace("%", "")
-
-    return key
-
+REQUESTED_KEYS = [
+    "WBC",
+    "LYMPH%",
+    "GRAN%",
+    "HGB",
+    "RBC",
+    "HCT",
+    "RDW-CV",
+    "PLT"
+]
 
 # ============================================================
-# PARSE KEYS
+# GEMINI PROMPT
 # ============================================================
 
-def parse_keys(keys: str) -> List[str]:
-    """
-    Supports:
+OCR_PROMPT = """
+You are a high-accuracy OCR engine for pathology/laboratory analyzer reports.
 
-    ["WBC","HGB","RBC"]
+Extract ONLY these requested keys:
+["WBC","LYMPH%","GRAN%","HGB","RBC","HCT","RDW-CV","PLT"]
 
-    and:
+columnCount=1.
 
-    [["WBC","HGB","RBC"]]
-    """
+Rules:
+- Match each key to its nearby value using physical image position.
+- Read top-to-bottom and left-to-right.
+- Ignore spaces, hyphens and underscores when matching keys.
+- LYMPH% = LYMPH %, RDW-CV = RDW CV.
+- Ignore H/L/HIGH/LOW/* flags between key and value.
+- Return only the actual result value, not units or reference ranges.
+- Never guess. If not confidently found, return "".
+- Return every requested key exactly as provided.
+- Return ONLY valid JSON. No extra keys.
 
-    try:
-
-        parsed = json.loads(keys)
-
-    except Exception as e:
-
-        raise ValueError(
-            f"Invalid keys JSON: {str(e)}"
-        )
-
-    # Nested list
-    if (
-        isinstance(parsed, list)
-        and len(parsed) > 0
-        and isinstance(parsed[0], list)
-    ):
-
-        parsed = parsed[0]
-
-    if not isinstance(parsed, list):
-
-        raise ValueError(
-            "keys must be a JSON array"
-        )
-
-    result = []
-
-    for key in parsed:
-
-        if key is None:
-            continue
-
-        key = str(key).strip()
-
-        if key:
-            result.append(key)
-
-    if not result:
-
-        raise ValueError(
-            "No valid keys supplied"
-        )
-
-    return result
-
+JSON format:
+{
+  "WBC": "",
+  "LYMPH%": "",
+  "GRAN%": "",
+  "HGB": "",
+  "RBC": "",
+  "HCT": "",
+  "RDW-CV": "",
+  "PLT": ""
+}
+"""
 
 # ============================================================
 # IMAGE PREPROCESSING
 # ============================================================
 
-def preprocess_image(
-    image_bytes: bytes,
-    content_type: str
-) -> tuple[bytes, str]:
-
+def preprocess_image(image_bytes: bytes) -> bytes:
     """
-    Image rules:
+    Resize and compress the image before sending it to Gemini.
 
-    1. If image <= 500 KB AND dimensions <= 2500:
-       use original image.
-
-    2. Otherwise:
-       - convert to RGB
-       - resize proportionally if dimension > 2500
-       - compress as JPEG
-       - try to keep <= 500 KB
-
-    Returns:
-
-        processed_bytes
-        mime_type
+    Important:
+    - Keeps aspect ratio.
+    - Converts to RGB.
+    - Does not crop.
+    - Does not aggressively sharpen.
+    - Uses JPEG compression.
     """
 
-    original_size = len(image_bytes)
+    image = Image.open(io.BytesIO(image_bytes))
 
-    # --------------------------------------------------------
-    # Open image
-    # --------------------------------------------------------
-
-    try:
-
-        image = Image.open(
-            io.BytesIO(image_bytes)
-        )
-
-        image.load()
-
-    except Exception as e:
-
-        raise ValueError(
-            f"Invalid image: {str(e)}"
-        )
-
-    width, height = image.size
-
-    print()
-    print("=" * 70)
-    print("IMAGE INFORMATION")
-    print("=" * 70)
-
-    print(
-        "Original size:",
-        original_size,
-        "bytes"
+    logger.info(
+        "Original image: %dx%d, %.2f KB",
+        image.width,
+        image.height,
+        len(image_bytes) / 1024
     )
 
-    print(
-        "Original dimensions:",
-        width,
-        "x",
-        height
-    )
+    # Fix camera EXIF orientation
+    image = ImageOps.exif_transpose(image)
 
-    print(
-        "Original MIME:",
-        content_type
-    )
-
-    # --------------------------------------------------------
-    # Rule 1:
-    # Original image is acceptable
-    # --------------------------------------------------------
-
-    if (
-        original_size <= MAX_IMAGE_SIZE
-        and width <= MAX_IMAGE_DIMENSION
-        and height <= MAX_IMAGE_DIMENSION
-    ):
-
-        print(
-            "Image processing:",
-            "NOT REQUIRED"
-        )
-
-        print(
-            "Using original image."
-        )
-
-        print("=" * 70)
-
-        return image_bytes, content_type
-
-    # --------------------------------------------------------
-    # Processing required
-    # --------------------------------------------------------
-
-    print(
-        "Image processing:",
-        "REQUIRED"
-    )
-
-    # --------------------------------------------------------
     # Convert to RGB
-    # --------------------------------------------------------
-
     if image.mode != "RGB":
+        if image.mode in ("RGBA", "LA"):
+            background = Image.new("RGB", image.size, "white")
+            alpha = image.getchannel("A") if "A" in image.getbands() else None
 
-        # Handle transparency correctly
-        if image.mode in (
-            "RGBA",
-            "LA"
-        ):
-
-            background = Image.new(
-                "RGB",
-                image.size,
-                "white"
-            )
-
-            if image.mode == "RGBA":
-
-                background.paste(
-                    image,
-                    mask=image.getchannel("A")
-                )
-
+            if alpha:
+                background.paste(image, mask=alpha)
+                image = background
             else:
-
-                background.paste(
-                    image,
-                    mask=image.getchannel("A")
-                )
-
-            image = background
-
+                image = image.convert("RGB")
         else:
-
             image = image.convert("RGB")
 
-    else:
-
-        image = image.copy()
-
     # --------------------------------------------------------
-    # Correct image orientation
-    # --------------------------------------------------------
-
-    try:
-
-        image = ImageOps.exif_transpose(
-            image
-        )
-
-    except Exception:
-
-        pass
-
-    # --------------------------------------------------------
-    # Resize proportionally
+    # Resize only when needed
     # --------------------------------------------------------
 
     width, height = image.size
-
-    max_dimension = max(
-        width,
-        height
-    )
+    max_dimension = max(width, height)
 
     if max_dimension > MAX_IMAGE_DIMENSION:
 
-        scale = (
-            MAX_IMAGE_DIMENSION
-            / max_dimension
-        )
+        scale = MAX_IMAGE_DIMENSION / max_dimension
 
-        new_width = max(
-            1,
-            int(width * scale)
-        )
+        new_width = max(1, int(width * scale))
+        new_height = max(1, int(height * scale))
 
-        new_height = max(
-            1,
-            int(height * scale)
-        )
-
-        print(
-            "Resizing:",
-            f"{width}x{height}",
-            "->",
-            f"{new_width}x{new_height}"
+        logger.info(
+            "Resizing image: %dx%d -> %dx%d",
+            width,
+            height,
+            new_width,
+            new_height
         )
 
         image = image.resize(
@@ -379,821 +192,309 @@ def preprocess_image(
             Image.Resampling.LANCZOS
         )
 
-    else:
-
-        print(
-            "Resize:",
-            "not required"
-        )
-
     # --------------------------------------------------------
     # JPEG compression
     # --------------------------------------------------------
 
-    best_bytes = None
-    best_quality = JPEG_START_QUALITY
-
     quality = JPEG_START_QUALITY
+    output = None
 
     while quality >= JPEG_MIN_QUALITY:
 
-        output = io.BytesIO()
+        buffer = io.BytesIO()
 
         image.save(
-            output,
+            buffer,
             format="JPEG",
             quality=quality,
             optimize=True,
             progressive=True
         )
 
-        compressed_bytes = output.getvalue()
+        data = buffer.getvalue()
+        size_kb = len(data) / 1024
 
-        print(
-            "JPEG quality:",
-            quality,
-            "size:",
-            len(compressed_bytes),
-            "bytes"
-        )
-
-        best_bytes = compressed_bytes
-        best_quality = quality
-
-        if len(compressed_bytes) <= MAX_IMAGE_SIZE:
-
+        if size_kb <= TARGET_IMAGE_KB:
+            output = data
             break
 
-        quality -= JPEG_QUALITY_STEP
+        quality -= 5
 
-    # --------------------------------------------------------
-    # Final result
-    # --------------------------------------------------------
+    if output is None:
+        buffer = io.BytesIO()
 
-    print(
-        "Final image:",
-        len(best_bytes),
-        "bytes"
-    )
-
-    print(
-        "Final JPEG quality:",
-        best_quality
-    )
-
-    print(
-        "Final dimensions:",
-        image.size[0],
-        "x",
-        image.size[1]
-    )
-
-    print("=" * 70)
-
-    return best_bytes, "image/jpeg"
-
-
-# ============================================================
-# CLEAN GEMINI RESPONSE
-# ============================================================
-
-def clean_json_response(
-    text: str
-) -> Dict[str, Any]:
-
-    """
-    Convert Gemini response into JSON object.
-
-    Handles:
-
-    {
-        "WBC": "5.2"
-    }
-
-    and markdown:
-
-    ```json
-    {
-        "WBC": "5.2"
-    }
-    """
-
-    if not text:
-
-        raise ValueError(
-            "Gemini returned an empty response"
+        image.save(
+            buffer,
+            format="JPEG",
+            quality=JPEG_MIN_QUALITY,
+            optimize=True,
+            progressive=True
         )
 
-    text = text.strip()
+        output = buffer.getvalue()
 
-    # Remove markdown code fence
-    text = re.sub(
-        r"^```json\s*",
-        "",
-        text,
-        flags=re.IGNORECASE
+    logger.info(
+        "Processed image: %dx%d, %.2f KB, quality=%d",
+        image.width,
+        image.height,
+        len(output) / 1024,
+        quality
     )
 
-    text = re.sub(
-        r"^```\s*",
-        "",
-        text
-    )
+    return output
 
-    text = re.sub(
-        r"\s*```$",
-        "",
-        text
-    )
 
-    text = text.strip()
+# ============================================================
+# JSON CLEANING
+# ============================================================
 
-    # --------------------------------------------------------
-    # Direct JSON
-    # --------------------------------------------------------
+def clean_result(raw_text: str) -> dict:
+    """
+    Safely convert Gemini output into the exact requested JSON.
+    """
+
+    if not raw_text:
+        return {key: "" for key in REQUESTED_KEYS}
+
+    text = raw_text.strip()
+
+    # Remove markdown JSON fences if Gemini returns them
+    if text.startswith("```"):
+        text = text.replace("```json", "", 1)
+        text = text.replace("```JSON", "", 1)
+
+        if text.endswith("```"):
+            text = text[:-3]
+
+        text = text.strip()
 
     try:
+        data = json.loads(text)
 
-        parsed = json.loads(text)
+    except Exception as e:
+        logger.warning("Invalid Gemini JSON: %s", e)
 
-        if isinstance(parsed, dict):
-
-            return parsed
-
-    except json.JSONDecodeError:
-
-        pass
+        return {
+            key: ""
+            for key in REQUESTED_KEYS
+        }
 
     # --------------------------------------------------------
-    # Extract JSON object
+    # Normalize possible alternative key formatting
     # --------------------------------------------------------
 
-    match = re.search(
-        r"\{.*\}",
-        text,
-        flags=re.DOTALL
-    )
+    normalized = {}
 
-    if match:
+    for key, value in data.items():
 
-        json_text = match.group(0)
-
-        try:
-
-            parsed = json.loads(
-                json_text
-            )
-
-            if isinstance(parsed, dict):
-
-                return parsed
-
-        except json.JSONDecodeError as e:
-
-            raise ValueError(
-                "Invalid JSON returned by Gemini: "
-                f"{str(e)}"
-            )
-
-    raise ValueError(
-        "Gemini response does not contain "
-        "a valid JSON object"
-    )
-
-
-# ============================================================
-# FIND VALUE FOR REQUESTED KEY
-# ============================================================
-
-def find_value_for_key(
-    gemini_data: Dict[str, Any],
-    requested_key: str
-) -> str:
-
-    requested_normalized = normalize_key(
-        requested_key
-    )
-
-    for response_key, value in gemini_data.items():
-
-        response_normalized = normalize_key(
-            str(response_key)
+        normalized_key = (
+            str(key)
+            .replace(" ", "")
+            .replace("-", "")
+            .replace("_", "")
+            .upper()
         )
 
-        if (
-            response_normalized
-            == requested_normalized
-        ):
+        normalized[normalized_key] = value
 
-            if value is None:
+    # --------------------------------------------------------
+    # Map exact requested keys
+    # --------------------------------------------------------
 
-                return ""
+    result = {}
 
-            return str(value).strip()
+    aliases = {
+        "WBC": ["WBC"],
+        "LYMPH%": ["LYMPH%", "LYMPH"],
+        "GRAN%": ["GRAN%", "GRAN"],
+        "HGB": ["HGB"],
+        "RBC": ["RBC"],
+        "HCT": ["HCT"],
+        "RDW-CV": ["RDWCV", "RDW-CV", "RDW"],
+        "PLT": ["PLT"]
+    }
 
-    return ""
+    for requested_key in REQUESTED_KEYS:
 
+        value = ""
 
-# ============================================================
-# CREATE GEMINI PROMPT
-# ============================================================
+        for alias in aliases[requested_key]:
 
-def create_prompt(
-    requested_keys: List[str],
-    column_count: int
-) -> str:
+            normalized_alias = (
+                alias
+                .replace(" ", "")
+                .replace("-", "")
+                .replace("_", "")
+                .upper()
+            )
 
-    keys_json = json.dumps(
-        requested_keys,
-        ensure_ascii=False
-    )
+            if normalized_alias in normalized:
 
-    prompt = f"""
-You are a high-accuracy OCR extraction engine for
-pathology and laboratory analyzer reports.
+                candidate = normalized[normalized_alias]
 
-Extract ONLY the requested keys from the image.
+                if candidate is None:
+                    value = ""
+                elif isinstance(candidate, (dict, list)):
+                    value = ""
+                else:
+                    value = str(candidate).strip()
 
-REQUESTED KEYS:
-{keys_json}
+                break
 
-COLUMN COUNT:
-{column_count}
+        result[requested_key] = value
 
-LAYOUT:
-
-The image may contain multiple key-value columns
-on the same physical row.
-
-columnCount={column_count} means a physical row
-can contain up to {column_count} key-value pairs.
-
-Example:
-
-WBC  5.2        HGB  10.7
-
-For columnCount=2:
-
-WBC -> 5.2
-HGB -> 10.7
-
-Use the physical position of text in the image.
-Do NOT match a value from another column.
-
-Read:
-1. top to bottom
-2. left to right within each row
-3. match each key with its nearby value
-
-KEY MATCHING:
-
-Ignore spaces, hyphens and underscores when
-matching keys.
-
-LYMPH% = LYMPH %
-RDW-CV = RDW CV
-
-Do NOT confuse RDW-CV with RDW-CV%.
-
-H/L flags may appear between a key and its value.
-
-Examples:
-
-WBC 5.2
-WBC H 5.2
-WBC L 5.2
-
-All mean:
-
-WBC = "5.2"
-
-Do not include H, L, HIGH, LOW or * as part
-of the result.
-
-VALUE:
-
-Return only the actual result value.
-
-Example:
-
-WBC 5.2 4.0-10.0
-
-Return:
-
-"WBC": "5.2"
-
-Do NOT return the reference range.
-
-Do NOT return units.
-
-Do NOT guess.
-
-If a requested key cannot be confidently found,
-return an empty string.
-
-OUTPUT:
-
-Return ONLY one valid JSON object.
-
-Return every requested key exactly as provided.
-
-Do not add extra keys.
-
-Example:
-
-{{
-    "WBC": "5.2",
-    "HGB": "10.7",
-    "RBC": "4.03"
-}}
-
-Missing:
-
-{{
-    "WBC": "5.2",
-    "HGB": "",
-    "RBC": "4.03"
-}}
-"""
-
-    return prompt
+    return result
 
 
 # ============================================================
-# PRINT TOKEN USAGE
+# HEALTH
 # ============================================================
 
-def print_usage(response):
-
-    print()
-    print("=" * 70)
-    print("GEMINI TOKEN USAGE")
-    print("=" * 70)
-
-    usage = getattr(
-        response,
-        "usage_metadata",
-        None
-    )
-
-    if usage is None:
-
-        print(
-            "Usage metadata not available."
-        )
-
-        print("=" * 70)
-
-        return
-
-    # Different SDK versions can expose
-    # slightly different fields.
-
-    prompt_tokens = getattr(
-        usage,
-        "prompt_token_count",
-        None
-    )
-
-    output_tokens = getattr(
-        usage,
-        "candidates_token_count",
-        None
-    )
-
-    thinking_tokens = getattr(
-        usage,
-        "thoughts_token_count",
-        None
-    )
-
-    total_tokens = getattr(
-        usage,
-        "total_token_count",
-        None
-    )
-
-    print(
-        "Input tokens:",
-        prompt_tokens
-    )
-
-    print(
-        "Output tokens:",
-        output_tokens
-    )
-
-    print(
-        "Thinking tokens:",
-        thinking_tokens
-    )
-
-    print(
-        "Total tokens:",
-        total_tokens
-    )
-
-    print("=" * 70)
+@app.get("/health")
+async def health():
+    return {
+        "status": "UP",
+        "model": MODEL_NAME,
+        "maxImageDimension": MAX_IMAGE_DIMENSION,
+        "targetImageKB": TARGET_IMAGE_KB
+    }
 
 
 # ============================================================
 # OCR ENDPOINT
 # ============================================================
 
-@app.post(
-    "/extract",
-    response_model=OCRResponse
-)
-async def extract(
+@app.post("/ocr/extract")
+async def extract_ocr(
     image: UploadFile = File(...),
-    keys: str = Form(...),
-    columnCount: int = Form(...)
+    keys: str = Form(default='["WBC","LYMPH%","GRAN%","HGB","RBC","HCT","RDW-CV","PLT"]'),
+    columnCount: str = Form(default="1")
 ):
 
-    # ========================================================
-    # Validate columnCount
-    # ========================================================
-
-    if columnCount <= 0:
-
-        print(
-            "ERROR: columnCount must be greater than 0"
-        )
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # ========================================================
-    # Parse keys
-    # ========================================================
-
     try:
 
-        requested_keys = parse_keys(
-            keys
-        )
+        # ----------------------------------------------------
+        # Read uploaded image
+        # ----------------------------------------------------
 
-    except Exception as e:
+        original_bytes = await image.read()
 
-        print()
-        print("=" * 70)
-        print("KEY PARSING ERROR")
-        print("=" * 70)
-
-        print(
-            "Error type:",
-            type(e).__name__
-        )
-
-        print(
-            "Error:",
-            str(e)
-        )
-
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    print()
-    print("=" * 70)
-    print("NEW OCR REQUEST")
-    print("=" * 70)
-
-    print(
-        "Requested keys:",
-        requested_keys
-    )
-
-    print(
-        "Column count:",
-        columnCount
-    )
-
-    # ========================================================
-    # Validate MIME type
-    # ========================================================
-
-    allowed_types = {
-        "image/jpeg",
-        "image/jpg",
-        "image/png",
-        "image/webp"
-    }
-
-    if image.content_type not in allowed_types:
-
-        print(
-            "ERROR: Unsupported image type:",
-            image.content_type
-        )
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # ========================================================
-    # Read image
-    # ========================================================
-
-    try:
-
-        original_image_bytes = await image.read()
-
-    except Exception as e:
-
-        print()
-        print("=" * 70)
-        print("IMAGE READ ERROR")
-        print("=" * 70)
-
-        print(
-            "Error type:",
-            type(e).__name__
-        )
-
-        print(
-            "Error:",
-            str(e)
-        )
-
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    if not original_image_bytes:
-
-        print(
-            "ERROR: Empty image"
-        )
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # ========================================================
-    # Preprocess image
-    # ========================================================
-
-    try:
-
-        image_bytes, image_mime_type = (
-            preprocess_image(
-                original_image_bytes,
-                image.content_type
+        if not original_bytes:
+            raise HTTPException(
+                status_code=400,
+                detail="Empty image"
             )
-        )
 
-    except Exception as e:
+        logger.info("=" * 70)
+        logger.info("NEW OCR REQUEST")
+        logger.info("Original upload: %.2f KB", len(original_bytes) / 1024)
+        logger.info("Requested keys: %s", keys)
+        logger.info("Column count: %s", columnCount)
+        logger.info("=" * 70)
 
-        print()
-        print("=" * 70)
-        print("IMAGE PROCESSING ERROR")
-        print("=" * 70)
+        # ----------------------------------------------------
+        # Preprocess
+        # ----------------------------------------------------
 
-        print(
-            "Error type:",
-            type(e).__name__
-        )
+        processed_bytes = preprocess_image(original_bytes)
 
-        print(
-            "Error:",
-            str(e)
-        )
-
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # ========================================================
-    # Create prompt
-    # ========================================================
-
-    prompt = create_prompt(
-        requested_keys,
-        columnCount
-    )
-
-    # ========================================================
-    # Call Gemini
-    # ========================================================
-
-    try:
-
-        print()
-        print("=" * 70)
-        print("CALLING GEMINI")
-        print("=" * 70)
-
-        print(
-            "Model:",
-            MODEL_NAME
-        )
-
-        print(
-            "Thinking:",
-            THINKING_LEVEL
-        )
-
-        print(
-            "Image sent:",
-            len(image_bytes),
-            "bytes"
-        )
+        # ----------------------------------------------------
+        # Gemini request
+        # ----------------------------------------------------
 
         response = client.models.generate_content(
-
             model=MODEL_NAME,
-
             contents=[
-
-                types.Part.from_text(
-                    text=prompt
-                ),
-
                 types.Part.from_bytes(
-                    data=image_bytes,
-                    mime_type=image_mime_type
-                )
+                    data=processed_bytes,
+                    mime_type="image/jpeg"
+                ),
+                OCR_PROMPT
             ],
-
             config=types.GenerateContentConfig(
-
                 temperature=0,
-
                 response_mime_type="application/json",
-
-                thinking_config=types.ThinkingConfig(
-                    thinking_level=THINKING_LEVEL
-                )
+                response_schema={
+                    "type": "object",
+                    "properties": {
+                        "WBC": {
+                            "type": "string"
+                        },
+                        "LYMPH%": {
+                            "type": "string"
+                        },
+                        "GRAN%": {
+                            "type": "string"
+                        },
+                        "HGB": {
+                            "type": "string"
+                        },
+                        "RBC": {
+                            "type": "string"
+                        },
+                        "HCT": {
+                            "type": "string"
+                        },
+                        "RDW-CV": {
+                            "type": "string"
+                        },
+                        "PLT": {
+                            "type": "string"
+                        }
+                    },
+                    "required": [
+                        "WBC",
+                        "LYMPH%",
+                        "GRAN%",
+                        "HGB",
+                        "RBC",
+                        "HCT",
+                        "RDW-CV",
+                        "PLT"
+                    ]
+                }
             )
         )
 
-        print()
-        print(
-            "GEMINI RESPONSE RECEIVED"
-        )
-
         # ----------------------------------------------------
-        # Print token usage
+        # Gemini result
         # ----------------------------------------------------
 
-        print_usage(
-            response
-        )
+        raw_text = response.text
 
-        # ----------------------------------------------------
-        # Get response text
-        # ----------------------------------------------------
+        logger.info("Gemini response: %s", raw_text)
 
-        response_text = response.text
+        result = clean_result(raw_text)
 
-        print()
-        print("Gemini response:")
+        logger.info("Final OCR result: %s", result)
 
-        print(
-            response_text
-        )
+        return result
+
+    except HTTPException:
+        raise
 
     except Exception as e:
 
-        print()
-        print("=" * 70)
-        print("GEMINI ERROR")
-        print("=" * 70)
+        logger.exception("OCR processing failed")
 
-        print(
-            "Error type:",
-            type(e).__name__
+        raise HTTPException(
+            status_code=500,
+            detail=str(e)
         )
-
-        print(
-            "Error:",
-            str(e)
-        )
-
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # ========================================================
-    # Parse Gemini JSON
-    # ========================================================
-
-    try:
-
-        gemini_data = clean_json_response(
-            response_text
-        )
-
-    except Exception as e:
-
-        print()
-        print("=" * 70)
-        print("JSON PARSING ERROR")
-        print("=" * 70)
-
-        print(
-            "Error type:",
-            type(e).__name__
-        )
-
-        print(
-            "Error:",
-            str(e)
-        )
-
-        print()
-        print(
-            "Gemini raw response:"
-        )
-
-        print(
-            response_text
-        )
-
-        print("=" * 70)
-
-        return OCRResponse(
-            status="ERROR",
-            data={}
-        )
-
-    # ========================================================
-    # Build final response
-    # ========================================================
-
-    final_data = {}
-
-    for requested_key in requested_keys:
-
-        value = find_value_for_key(
-            gemini_data,
-            requested_key
-        )
-
-        final_data[
-            requested_key
-        ] = value
-
-    # ========================================================
-    # Print final result
-    # ========================================================
-
-    print()
-    print("=" * 70)
-    print("FINAL OCR RESULT")
-    print("=" * 70)
-
-    print(
-        json.dumps(
-            final_data,
-            indent=4,
-            ensure_ascii=False
-        )
-    )
-
-    print("=" * 70)
-
-    # ========================================================
-    # SUCCESS
-    # ========================================================
-
-    return OCRResponse(
-        status="SUCCESS",
-        data=final_data
-    )
 
 
 # ============================================================
-# LOCAL DEVELOPMENT
+# LOCAL RUN
 # ============================================================
 
-# Do NOT use reload=True in production.
-#
-# if __name__ == "__main__":
-#
-#     import uvicorn
-#
-#     uvicorn.run(
-#         "main:app",
-#         host="0.0.0.0",
-#         port=8000,
-#         reload=True
-#     )
+if __name__ == "__main__":
 
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8080"))
+
+    uvicorn.run(
+        "main:app",
+        host="0.0.0.0",
+        port=port
+    )
