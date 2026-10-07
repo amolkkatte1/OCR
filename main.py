@@ -21,28 +21,44 @@ if not GEMINI_API_KEY:
     )
 
 
+# ============================================================
+# GEMINI MODEL
+# ============================================================
+
 # DO NOT CHANGE
 MODEL_NAME = "gemini-3.8-flash"
 
 
 # ============================================================
-# COST / IMAGE SETTINGS
+# IMAGE COST OPTIMIZATION
 # ============================================================
 
-# Maximum dimension sent to Gemini.
+# Maximum width/height sent to Gemini.
 #
-# 768 = lower image cost
-# 1024 = safer accuracy
+# 768  -> lower image token usage
+# 1024 -> better safety for small text
 #
-# You can override these using Render environment variables.
+# Default = 768
 MAX_IMAGE_DIMENSION = int(
-    os.getenv("OCR_MAX_IMAGE_DIMENSION", "768")
+    os.getenv(
+        "OCR_MAX_IMAGE_DIMENSION",
+        "768"
+    )
 )
 
-# JPEG target size.
+
+# Target JPEG size.
+#
+# This mainly reduces upload/network size.
+# Resolution reduction is the more important
+# part for vision-token cost.
 TARGET_IMAGE_KB = int(
-    os.getenv("OCR_TARGET_IMAGE_KB", "100")
+    os.getenv(
+        "OCR_TARGET_IMAGE_KB",
+        "100"
+    )
 )
+
 
 JPEG_START_QUALITY = 82
 JPEG_MIN_QUALITY = 60
@@ -83,17 +99,23 @@ app = FastAPI(
 # IMAGE PREPROCESSING
 # ============================================================
 
-def preprocess_image(image_bytes: bytes) -> bytes:
-    """
-    Reduce image size before sending it to Gemini.
+def preprocess_image(
+    image_bytes: bytes
+) -> bytes:
 
-    - Fixes EXIF camera rotation
-    - Converts image to RGB
-    - Keeps aspect ratio
-    - Resizes only when necessary
-    - Does not crop
-    - Does not change the content/layout
-    - Compresses to JPEG
+    """
+    Resize/compress image before Gemini.
+
+    Steps:
+    1. Read image
+    2. Fix EXIF camera rotation
+    3. Convert to RGB
+    4. Resize if larger than MAX_IMAGE_DIMENSION
+    5. Compress as JPEG
+    6. Return bytes
+
+    No cropping is performed.
+    Aspect ratio is preserved.
     """
 
     image = Image.open(
@@ -108,10 +130,12 @@ def preprocess_image(image_bytes: bytes) -> bytes:
     )
 
     # --------------------------------------------------------
-    # Correct camera orientation
+    # Fix camera orientation
     # --------------------------------------------------------
 
-    image = ImageOps.exif_transpose(image)
+    image = ImageOps.exif_transpose(
+        image
+    )
 
     # --------------------------------------------------------
     # Convert to RGB
@@ -119,7 +143,10 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 
     if image.mode != "RGB":
 
-        if image.mode in ("RGBA", "LA"):
+        if image.mode in (
+            "RGBA",
+            "LA"
+        ):
 
             background = Image.new(
                 "RGB",
@@ -129,7 +156,9 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 
             if "A" in image.getbands():
 
-                alpha = image.getchannel("A")
+                alpha = image.getchannel(
+                    "A"
+                )
 
                 background.paste(
                     image,
@@ -219,7 +248,9 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 
         data = buffer.getvalue()
 
-        if len(data) <= TARGET_IMAGE_KB * 1024:
+        if len(data) <= (
+            TARGET_IMAGE_KB * 1024
+        ):
 
             processed_bytes = data
             selected_quality = quality
@@ -257,7 +288,10 @@ def preprocess_image(image_bytes: bytes) -> bytes:
 # PARSE KEYS
 # ============================================================
 
-def parse_keys(keys_input: str) -> list[str]:
+def parse_keys(
+    keys_input: str
+) -> list[str]:
+
     """
     Accept keys from the API request.
 
@@ -269,13 +303,17 @@ def parse_keys(keys_input: str) -> list[str]:
 
     [["WBC","HGB","RBC"]]
 
-    or:
+    or comma-separated:
 
-    ["WBC", "LYMPH%", "RDW-CV"]
+    WBC,HGB,RBC
     """
 
     if not keys_input:
         return []
+
+    # --------------------------------------------------------
+    # Try JSON
+    # --------------------------------------------------------
 
     try:
 
@@ -285,7 +323,10 @@ def parse_keys(keys_input: str) -> list[str]:
 
     except json.JSONDecodeError:
 
-        # Fallback for comma-separated input
+        # ----------------------------------------------------
+        # Fallback: comma-separated
+        # ----------------------------------------------------
+
         parsed = [
             item.strip()
             for item in keys_input.split(",")
@@ -293,7 +334,7 @@ def parse_keys(keys_input: str) -> list[str]:
         ]
 
     # --------------------------------------------------------
-    # Handle nested array
+    # Nested array support
     # --------------------------------------------------------
 
     if (
@@ -301,13 +342,17 @@ def parse_keys(keys_input: str) -> list[str]:
         and len(parsed) == 1
         and isinstance(parsed[0], list)
     ):
+
         parsed = parsed[0]
 
     # --------------------------------------------------------
     # Validate
     # --------------------------------------------------------
 
-    if not isinstance(parsed, list):
+    if not isinstance(
+        parsed,
+        list
+    ):
 
         raise HTTPException(
             status_code=400,
@@ -321,26 +366,37 @@ def parse_keys(keys_input: str) -> list[str]:
         if key is None:
             continue
 
-        if not isinstance(key, str):
+        if not isinstance(
+            key,
+            str
+        ):
 
             key = str(key)
 
         key = key.strip()
 
-        if key and key not in result:
+        if (
+            key
+            and key not in result
+        ):
 
-            result.append(key)
+            result.append(
+                key
+            )
 
     return result
 
 
 # ============================================================
-# KEY NORMALIZATION
+# NORMALIZE KEY
 # ============================================================
 
-def normalize_key(key: str) -> str:
+def normalize_key(
+    key: str
+) -> str:
+
     """
-    Used only internally for matching.
+    Normalize keys only for internal matching.
 
     Examples:
 
@@ -351,7 +407,9 @@ def normalize_key(key: str) -> str:
     RDW_CV  -> RDWCV
     """
 
-    value = str(key).upper().strip()
+    value = str(
+        key
+    ).upper().strip()
 
     value = value.replace(
         " ",
@@ -372,7 +430,7 @@ def normalize_key(key: str) -> str:
 
 
 # ============================================================
-# BUILD OCR PROMPT
+# BUILD DYNAMIC PROMPT
 # ============================================================
 
 def build_prompt(
@@ -380,10 +438,18 @@ def build_prompt(
     column_count: int
 ) -> str:
 
+    # --------------------------------------------------------
+    # Requested keys come ONLY from request
+    # --------------------------------------------------------
+
     requested_keys_json = json.dumps(
         requested_keys,
         ensure_ascii=False
     )
+
+    # --------------------------------------------------------
+    # Dynamic JSON example
+    # --------------------------------------------------------
 
     example_result = {
         key: ""
@@ -407,43 +473,47 @@ columnCount={column_count}
 
 Rules:
 
-- Match each requested key to its nearby value using the
-  physical image position.
+- Match each key to its nearby value using physical image
+  position.
 
 - Read top-to-bottom and left-to-right.
 
 - Ignore spaces, hyphens and underscores when matching keys.
 
-- LYMPH% can appear as LYMPH %.
+- LYMPH% may appear as LYMPH %.
 
-- RDW-CV can appear as RDW CV or RDW_CV.
+- RDW-CV may appear as RDW CV or RDW_CV.
 
 - Ignore H/L/HIGH/LOW/* flags between the key and its value.
 
-- Return only the actual result value.
+- Return ONLY the actual result value.
 
-- Do not return units.
+- Do NOT return units.
 
-- Do not return reference ranges.
+- Do NOT return reference ranges.
 
-- Do not return H/L flags.
+- Do NOT return H/L flags.
 
-- Do not return labels or explanations.
+- Do NOT return labels.
+
+- Do NOT return explanations.
 
 - Never guess.
 
-- If a requested key is not confidently found, return "".
+- If a requested key cannot be confidently found,
+  return an empty string.
 
-- If there are multiple columns, use columnCount={column_count}
-  to understand the image layout.
-
-- Use physical image position to associate a key with its value.
+- Use physical image position to associate each parameter
+  with its value.
 
 - Do not infer a value from another parameter.
 
+- If multiple columns are present, use columnCount={column_count}
+  to understand the layout.
+
 - Return every requested key exactly as provided.
 
-- Do not add any key that was not requested.
+- Do NOT add any key that was not requested.
 
 - Return ONLY valid JSON.
 
@@ -454,7 +524,7 @@ Expected JSON structure:
 
 
 # ============================================================
-# CLEAN GEMINI RESPONSE
+# CLEAN GEMINI RESULT
 # ============================================================
 
 def clean_result(
@@ -462,7 +532,10 @@ def clean_result(
     requested_keys: list[str]
 ) -> dict:
 
-    # Always start with only requested keys
+    # --------------------------------------------------------
+    # Always return only requested keys
+    # --------------------------------------------------------
+
     result = {
         key: ""
         for key in requested_keys
@@ -474,7 +547,7 @@ def clean_result(
     text = raw_text.strip()
 
     # --------------------------------------------------------
-    # Remove markdown code fences if returned unexpectedly
+    # Remove markdown fences if necessary
     # --------------------------------------------------------
 
     if text.startswith("```"):
@@ -516,11 +589,15 @@ def clean_result(
 
         return result
 
-    if not isinstance(data, dict):
+    if not isinstance(
+        data,
+        dict
+    ):
+
         return result
 
     # --------------------------------------------------------
-    # Normalize Gemini keys
+    # Normalize Gemini response keys
     # --------------------------------------------------------
 
     normalized_data = {}
@@ -532,7 +609,7 @@ def clean_result(
         ] = value
 
     # --------------------------------------------------------
-    # Return ONLY requested keys
+    # Extract only requested keys
     # --------------------------------------------------------
 
     for requested_key in requested_keys:
@@ -546,7 +623,7 @@ def clean_result(
             ""
         )
 
-        # Never return objects/lists as OCR values
+        # Do not return complex values
         if isinstance(
             value,
             (dict, list)
@@ -569,6 +646,97 @@ def clean_result(
         ] = value
 
     return result
+
+
+# ============================================================
+# TOKEN USAGE LOGGER
+# ============================================================
+
+def print_token_usage(
+    response
+) -> None:
+
+    print()
+
+    print(
+        "GEMINI TOKEN USAGE"
+    )
+
+    print(
+        "=" * 70
+    )
+
+    usage = getattr(
+        response,
+        "usage_metadata",
+        None
+    )
+
+    if usage is None:
+
+        print(
+            "Input tokens: None"
+        )
+
+        print(
+            "Output tokens: None"
+        )
+
+        print(
+            "Thinking tokens: None"
+        )
+
+        print(
+            "Total tokens: None"
+        )
+
+    else:
+
+        input_tokens = getattr(
+            usage,
+            "prompt_token_count",
+            None
+        )
+
+        output_tokens = getattr(
+            usage,
+            "candidates_token_count",
+            None
+        )
+
+        thinking_tokens = getattr(
+            usage,
+            "thoughts_token_count",
+            None
+        )
+
+        total_tokens = getattr(
+            usage,
+            "total_token_count",
+            None
+        )
+
+        print(
+            f"Input tokens: {input_tokens}"
+        )
+
+        print(
+            f"Output tokens: {output_tokens}"
+        )
+
+        print(
+            f"Thinking tokens: {thinking_tokens}"
+        )
+
+        print(
+            f"Total tokens: {total_tokens}"
+        )
+
+    print(
+        "=" * 70
+    )
+
+    print()
 
 
 # ============================================================
@@ -613,7 +781,7 @@ async def extract_ocr(
             )
 
         # ====================================================
-        # READ KEYS FROM INPUT
+        # READ KEYS FROM REQUEST
         # ====================================================
 
         requested_keys = parse_keys(
@@ -628,7 +796,7 @@ async def extract_ocr(
             )
 
         # ====================================================
-        # READ COLUMN COUNT FROM INPUT
+        # READ COLUMN COUNT FROM REQUEST
         # ====================================================
 
         try:
@@ -645,7 +813,6 @@ async def extract_ocr(
             column_count = 1
 
         if column_count < 1:
-
             column_count = 1
 
         # ====================================================
@@ -671,7 +838,7 @@ async def extract_ocr(
         )
 
         logger.info(
-            "Original size: %.2f KB",
+            "Original image size: %.2f KB",
             len(original_bytes) / 1024
         )
 
@@ -688,7 +855,7 @@ async def extract_ocr(
         )
 
         # ====================================================
-        # BUILD PROMPT USING INPUT KEYS
+        # BUILD PROMPT
         # ====================================================
 
         prompt = build_prompt(
@@ -697,7 +864,7 @@ async def extract_ocr(
         )
 
         # ====================================================
-        # CALL GEMINI
+        # GEMINI REQUEST
         # ====================================================
 
         response = client.models.generate_content(
@@ -721,24 +888,36 @@ async def extract_ocr(
         )
 
         # ====================================================
-        # READ RESPONSE
+        # PRINT TOKEN USAGE
+        # ====================================================
+
+        print_token_usage(
+            response
+        )
+
+        # ====================================================
+        # READ GEMINI RESPONSE
         # ====================================================
 
         raw_text = response.text
 
         logger.info(
-            "Gemini response: %s",
+            "Gemini raw response: %s",
             raw_text
         )
 
         # ====================================================
-        # CLEAN RESPONSE
+        # CLEAN RESULT
         # ====================================================
 
         result = clean_result(
             raw_text,
             requested_keys
         )
+
+        # ====================================================
+        # LOG FINAL RESULT
+        # ====================================================
 
         logger.info(
             "Final OCR result: %s",
@@ -750,7 +929,7 @@ async def extract_ocr(
         )
 
         # ====================================================
-        # RETURN
+        # RETURN ONLY REQUESTED KEYS
         # ====================================================
 
         return result
@@ -790,5 +969,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-
 
