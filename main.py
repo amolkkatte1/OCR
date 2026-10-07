@@ -44,6 +44,7 @@ MAX_IMAGE_DIMENSION = 768
 # than raw JPEG KB.
 MAX_IMAGE_SIZE = 150 * 1024  # 150 KB
 
+# JPEG quality range
 JPEG_START_QUALITY = 82
 JPEG_MIN_QUALITY = 60
 JPEG_QUALITY_STEP = 5
@@ -202,9 +203,6 @@ def preprocess_image(
     IMPORTANT:
 
     Every image is normalized to a maximum dimension of 768px.
-
-    This is intentional because sending a large image to Gemini
-    can increase image input tokens and therefore API cost.
 
     Rules:
 
@@ -548,6 +546,88 @@ def find_value_for_key(
 
 
 # ============================================================
+# CONVERT WBC / PLT VALUES
+# ============================================================
+
+def convert_result_value(
+    requested_key: str,
+    value: str
+) -> str:
+
+    if not value:
+        return value
+
+    normalized_key = normalize_key(
+        requested_key
+    )
+
+    # --------------------------------------------------------
+    # WBC
+    #
+    # 11.0 -> 11000
+    # 5.7  -> 5700
+    # --------------------------------------------------------
+
+    if normalized_key == "WBC":
+
+        try:
+
+            number = float(value)
+
+            converted = number * 1000
+
+            if converted.is_integer():
+
+                return str(
+                    int(converted)
+                )
+
+            return str(
+                converted
+            )
+
+        except (ValueError, TypeError):
+
+            return value
+
+    # --------------------------------------------------------
+    # PLT
+    #
+    # 232 -> 232000
+    # 104 -> 104000
+    # 84  -> 84000
+    # --------------------------------------------------------
+
+    if normalized_key == "PLT":
+
+        try:
+
+            number = float(value)
+
+            converted = number * 1000
+
+            if converted.is_integer():
+
+                return str(
+                    int(converted)
+                )
+
+            return str(
+                converted
+            )
+
+        except (ValueError, TypeError):
+
+            return value
+
+    # --------------------------------------------------------
+    # All other keys
+    # --------------------------------------------------------
+
+    return value
+
+
+# ============================================================
 # CREATE GEMINI PROMPT
 # ============================================================
 
@@ -560,13 +640,6 @@ def create_prompt(
         requested_keys,
         ensure_ascii=False
     )
-
-    # IMPORTANT:
-    # Keep this prompt short.
-    #
-    # The old prompt repeated many instructions and examples.
-    # This version preserves the important OCR rules while
-    # reducing unnecessary input tokens.
 
     prompt = f"""
 OCR the laboratory analyzer image.
@@ -983,6 +1056,11 @@ async def extract(
             str(e)
         )
 
+        print(
+            "Error:",
+            str(e)
+        )
+
         print("=" * 70)
 
         return OCRResponse(
@@ -1044,6 +1122,15 @@ async def extract(
         value = find_value_for_key(
             gemini_data,
             requested_key
+        )
+
+        # ----------------------------------------------------
+        # Convert WBC / PLT values
+        # ----------------------------------------------------
+
+        value = convert_result_value(
+            requested_key,
+            value
         )
 
         final_data[
